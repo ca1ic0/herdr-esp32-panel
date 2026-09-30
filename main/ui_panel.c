@@ -436,6 +436,11 @@ static lv_obj_t *new_screen(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(COLOR_BG), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_set_scrollable(scr, false);
+    /* the default theme pads lv_obj by ~20px; children use absolute
+     * coordinates, so padding must be zeroed or they overflow the screen */
+    lv_obj_set_style_pad_all(scr, 0, 0);
+    lv_obj_set_style_pad_row(scr, 0, 0);
+    lv_obj_set_style_pad_column(scr, 0, 0);
     return scr;
 }
 
@@ -475,6 +480,7 @@ static void build_home(void)
     lv_obj_set_style_border_width(bar, 0, 0);
     lv_obj_set_style_radius(bar, 0, 0);
     lv_obj_set_scrollable(bar, false);
+    lv_obj_set_style_pad_all(bar, 0, 0);
 
     s_conn_label = ui_label(bar, 12, 12, 200, "", 12, COLOR_DIM);
 
@@ -587,6 +593,7 @@ static void build_settings(void)
         lv_obj_set_size(row, 456, 76);
         lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_PANEL), 0);
         lv_obj_set_style_radius(row, 12, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
         lv_obj_add_event_cb(row, rows[i].cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t *ic = lv_label_create(row);
@@ -597,6 +604,8 @@ static void build_settings(void)
 
         lv_obj_t *t = lv_label_create(row);
         lv_label_set_text(t, rows[i].title);
+        lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(t, 372);
         lv_obj_set_style_text_font(t, ui_font(16), 0);
         lv_obj_set_style_text_color(t, lv_color_hex(COLOR_TEXT), 0);
         lv_obj_align(t, LV_ALIGN_LEFT_MID, 52, -12);
@@ -604,6 +613,8 @@ static void build_settings(void)
         if (rows[i].sub != NULL) {
             lv_obj_t *sub = lv_label_create(row);
             lv_label_set_text(sub, "");
+            lv_label_set_long_mode(sub, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(sub, 372);
             lv_obj_set_style_text_font(sub, ui_font(12), 0);
             lv_obj_set_style_text_color(sub, lv_color_hex(COLOR_DIM), 0);
             lv_obj_align(sub, LV_ALIGN_LEFT_MID, 52, 14);
