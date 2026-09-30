@@ -1,0 +1,60 @@
+menu "Herdr Panel Configuration"
+
+    config HERDR_WIFI_SSID
+        string "WiFi SSID (default)"
+        default "YOUR_SSID"
+        help
+            Default SSID used when NVS is empty. The device enters
+            provisioning mode (QR code + web page) when unconfigured;
+            values stored in NVS override this default.
+
+    config HERDR_WIFI_PASSWORD
+        string "WiFi password (default)"
+        default "YOUR_PASSWORD"
+        help
+            Default WiFi password used when NVS is empty.
+
+    config HERDR_BACKEND_HOST
+        string "herdr backend host (default)"
+        default "192.168.1.100"
+        help
+            Host name or IP of the herdr-restful FastAPI service running
+            on the PC. Overridden by the value stored in NVS.
+
+    config HERDR_BACKEND_PORT
+        int "herdr backend port (default)"
+        range 1 65535
+        default 8080
+        help
+            Port of the herdr-restful service.
+
+    config HERDR_POLL_INTERVAL_MS
+        int "Session poll interval (ms)"
+        range 500 60000
+        default 3000
+        help
+            How often the panel re-reads the session list from the backend.
+
+    config HERDR_ACTION_ALLOW_TEXT
+        string "Payload sent for ALLOW"
+        default "allow"
+        help
+            Text typed into the selected pane followed by Enter when the
+            Allow button is pressed. Adapt it to the approval dialog of the
+            agent CLI you run (e.g. "1" for numbered menus, "y" for y/n).
+
+    config HERDR_ACTION_DENY_TEXT
+        string "Payload sent for DENY"
+        default "deny"
+        help
+            Text typed into the selected pane followed by Enter when the
+            Deny button is pressed.
+
+    config HERDR_ACTION_CONTINUE_TEXT
+        string "Payload sent for CONTINUE"
+        default "continue"
+        help
+            Text typed into the selected pane followed by Enter when the
+            Continue button is pressed.
+
+endmenu
