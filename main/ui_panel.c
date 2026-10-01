@@ -19,6 +19,7 @@
 #include <time.h>
 
 #include "esp_system.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -135,6 +136,15 @@ static bool s_dimmed;
 static int64_t s_boot_started_ms;
 static bool s_boot_provision;
 static bool s_boot_ready;
+
+static void log_ui_memory(const char *phase)
+{
+    lv_mem_monitor_t mon = { 0 };
+    lv_mem_monitor(&mon);
+    ESP_LOGI("ui_panel", "%s: LVGL heap free=%u largest=%u used=%u%%",
+             phase, (unsigned)mon.free_size,
+             (unsigned)mon.free_biggest_size, (unsigned)mon.used_pct);
+}
 
 static uint32_t s_edit_id;
 
@@ -1412,11 +1422,18 @@ static void show_screen(screen_t s)
     if (scr != NULL) {
         panel_prefs_t p;
         panel_prefs_get(&p);
-        if (previous != s && !p.reduce_motion &&
+        if (previous != s && previous != SCR_BOOT && s != SCR_BOOT && !p.reduce_motion &&
             s != SCR_CONFIRM && s != SCR_PROVISION) {
             lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_FADE_IN, 120, 0, false);
         } else {
             lv_screen_load(scr);
+        }
+        if (previous == SCR_BOOT && s != SCR_BOOT && s_boot != NULL) {
+            lv_obj_delete(s_boot);
+            s_boot = NULL;
+            s_boot_progress = NULL;
+            for (int i = 0; i < 4; i++) s_boot_cells[i] = NULL;
+            log_ui_memory("boot released");
         }
         if (s == SCR_SOUND && !panel_audio_ready()) {
             lv_label_set_text(s_sound_status, "声音不可用，请检查扬声器");
@@ -1735,18 +1752,26 @@ void ui_panel_init(void)
 {
     build_agent_icons();
     build_boot();
+    log_ui_memory("boot built");
+    s_boot_started_ms = ui_now_ms();
+    show_screen(SCR_BOOT);
+    /* Put a known frame on the panel before allocating every settings page.
+     * If a later startup stage fails, the serial checkpoints and this frame
+     * distinguish UI allocation from panel power or SPI failures. */
+    lv_refr_now(NULL);
+    ESP_LOGI("ui_panel", "boot frame flushed");
     build_home();
     build_detail();
     build_confirm();
     build_result();
     build_settings();
     build_pref_pages();
+    log_ui_memory("pages built");
     build_provision();
+    log_ui_memory("provision built");
     panel_store_set_view_context(s_page, NULL);
     refresh_prefs_ui();
     refresh_power_ui();
-    s_boot_started_ms = ui_now_ms();
-    show_screen(SCR_BOOT);
 }
 
 void ui_show_provisioning(const char *ap_ssid, const char *ap_pass, const char *qr_payload)

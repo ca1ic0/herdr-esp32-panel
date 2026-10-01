@@ -81,9 +81,6 @@ bool Custom_PmicReadBattery(PmicBatteryStatus *out) {
 
 void Custom_PmicRegisterInit(void) {
     axp2101.setVbusCurrentLimit(XPOWERS_AXP2101_VBUS_CUR_LIM_2000MA);
-    axp2101.enableBattDetection();
-    axp2101.enableBattVoltageMeasure();
-    axp2101.enableGauge();
 
     if(axp2101.getDC1Voltage() != 3300) {
         axp2101.setDC1Voltage(3300);
@@ -109,6 +106,11 @@ void Custom_PmicRegisterInit(void) {
     axp2101.setPrechargeCurr(XPOWERS_AXP2101_PRECHARGE_50MA);
     axp2101.setChargerConstantCurr(XPOWERS_AXP2101_CHG_CUR_500MA);
     axp2101.setChargerTerminationCurr(XPOWERS_AXP2101_CHG_ITERM_50MA);
+
+    /* Complete display power setup before enabling optional gauge features. */
+    axp2101.enableBattDetection();
+    axp2101.enableBattVoltageMeasure();
+    axp2101.enableGauge();
 }
 
 void Axp2101_isChargingTask(void *arg) {

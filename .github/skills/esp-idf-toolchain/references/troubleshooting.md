@@ -29,7 +29,7 @@
 
 | 报错关键词 | 根因 | 修复 |
 | --- | --- | --- |
-| `LV_MEM_SIZE_KILOBYTES is deprecated`（`-Werror=cpp` 变错误） | 旧 Kconfig 项触发 `#warning` | `sdkconfig.defaults` 改 `CONFIG_LV_MEM_SIZE=65536`（字节），并**删除 sdkconfig 重新生成** |
+| `LV_MEM_SIZE_KILOBYTES is deprecated`（`-Werror=cpp` 变错误） | 旧 Kconfig 项触发 `#warning` | `sdkconfig.defaults` 使用 `CONFIG_LV_MEM_SIZE`（字节），并**删除 sdkconfig 重新生成** |
 | `'lv_obj_add_flag' is deprecated` / `lv_obj_remove_flag` / `lv_obj_clear_flag` | v9.6 弃用批量 flag API | 改 `lv_obj_set_hidden()` / `lv_obj_set_scrollable()` / `lv_obj_set_clickable()` |
 | `Both LV_MEM_SIZE and LV_MEM_SIZE_KILOBYTES are defined` | 旧项残留 sdkconfig | 删 sdkconfig 再构建 |
 

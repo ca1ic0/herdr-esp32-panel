@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_netif_sntp.h"
 #include "sdkconfig.h"
 
@@ -70,6 +71,13 @@ static void power_sample_task(void *arg)
     }
 }
 
+static void log_boot_memory(const char *phase)
+{
+    ESP_LOGI(TAG, "%s: free=%u largest=%u", phase,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
+
 extern "C" void panel_display_set_brightness(uint8_t percent)
 {
     if (user_display != NULL) user_display->Set_Backlight(percent);
@@ -94,6 +102,7 @@ extern "C" void app_main(void)
     /* power management chip (AXP2101) — must be first: it switches the
      * display rail (ALDO3) used by the panel reset sequence */
     Custom_PmicPortInit(&user_i2cbus, 0x34);
+    log_boot_memory("PMIC ready");
 
     ESP_ERROR_CHECK(app_config_init());
     ESP_ERROR_CHECK(panel_prefs_init());
@@ -107,11 +116,11 @@ extern "C" void app_main(void)
                                    BSP_LCD_TOUCH_INT, BSP_LCD_TOUCH_RST);
     user_display->DisplayPort_TouchInit();
     panel_display_set_brightness(prefs.brightness);
+    log_boot_memory("display ready");
 
     /* LVGL port (display + touch) */
     Lvgl_PortInit(*user_display);
-    xTaskCreatePinnedToCore(power_sample_task, "power_sample", 3072,
-                            NULL, 3, NULL, 0);
+    log_boot_memory("LVGL ready");
 
     /* Bring up the splash before network and codec startup so it animates
      * while those subsystems initialise. LVGL remains owned by its task. */
@@ -120,6 +129,9 @@ extern "C" void app_main(void)
         ui_panel_init();
         lv_timer_create(ui_tick_cb, 200, NULL);
         Lvgl_unlock();
+        log_boot_memory("UI ready");
+    } else {
+        ESP_LOGE(TAG, "LVGL lock failed; UI was not created");
     }
 
     if (!panel_audio_start(user_i2cbus.Get_I2cBusHandle())) {
@@ -145,6 +157,14 @@ extern "C" void app_main(void)
         ui_panel_boot_ready();
         Lvgl_unlock();
     }
+
+    /* I2C battery polling is low priority and must not compete with the
+     * panel reset, touch setup or first UI frame. */
+    if (xTaskCreatePinnedToCore(power_sample_task, "power_sample", 3072,
+                                NULL, 3, NULL, 0) != pdPASS) {
+        ESP_LOGW(TAG, "battery task unavailable");
+    }
+    log_boot_memory("startup complete");
 
     if (!provisioning_active()) {
         panel_worker_start();

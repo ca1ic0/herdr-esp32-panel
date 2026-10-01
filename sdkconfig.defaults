@@ -22,7 +22,9 @@ CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM=y
 # LVGL v9 (RGB565 panel needs byte-swapped colors)
 CONFIG_LV_COLOR_16_SWAP=y
 CONFIG_LV_COLOR_SCREEN_TRANSP=y
-CONFIG_LV_MEM_SIZE=65536
+# All 16 screens are instantiated at startup. 64 KiB leaves no headroom
+# after the boot animation and settings controls were added.
+CONFIG_LV_MEM_SIZE=98304
 CONFIG_LV_FONT_MONTSERRAT_12=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_16=y
