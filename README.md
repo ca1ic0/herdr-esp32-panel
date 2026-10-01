@@ -25,16 +25,17 @@
 ```text
 main/
   app_main.cpp           启动与生命周期
-  app_config.c/h         NVS 唯一属主；Wi-Fi + 网关地址 + 设备令牌
+  app_config.c/h         Wi-Fi、网关、设备令牌及继续提示词 NVS 配置
   wifi_connect.c/h       STA 连接与自动重连
-  provisioning.c/h       WPA2 SoftAP + 配网页（含网关令牌字段）
+  provisioning.c/h       WPA2 SoftAP + 首次配网/临时编辑网页
   panel_model.h          有界数据结构与三层状态
   panel_store.c/h        快照 store + 有界队列（action_q/control_q/ui_evt_q）
   panel_api_client.c/h   唯一 HTTP 客户端，对接 /api/v1/panel
   panel_worker.c/h       请求调度、轮询、动作状态机
   panel_prefs.c/h        运行时设置、范围校验与 NVS 保存
   panel_audio.cpp/h      ES8311/I2S 播放任务及有界音效队列
-  ui_panel.c/h           LVGL 页面（HOM/DET/CNF/RST/SET/PRV）
+  panel_power.h          后台 AXP2101 电量快照接口
+  ui_panel.c/h           LVGL 页面（BOOT/HOM/DET/CNF/RST/SET/PRV）
   ui_common.h            色板与字体
 components/              板级显示/触摸/电源与 LVGL 适配
 docs/                    目标规格与验收清单
@@ -86,15 +87,17 @@ idf.py -p PORT flash monitor
 3. 手机连接热点后打开 `http://192.168.4.1`，填写家用 Wi-Fi、网关地址/端口和**设备网关令牌**。
 4. 保存后设备重启并尝试连接；保存成功不等于连通，屏幕会区分状态。
 
+已配网时可从“连接→扫码编辑连接”或“会话→扫码编辑继续提示词”进入临时编辑热点；5 分钟后自动退出，也可在设备上取消。网页中留空的连接字段保留旧值，勾选“恢复网关默认提示词”清除设备覆盖值。编辑连接会软重启，不清除声音、显示和会话偏好。自定义继续提示词最多 160 个 UTF-8 字节，审批/终端原生继续选项仍由主机网关现场复验。
+
 网关令牌需先在主机侧生成。Wi-Fi 密码与令牌不会显示在屏幕上，也不会出现在日志中。
 
 ## 阶段说明
 
 按 [ACCEPTANCE.md](docs/ACCEPTANCE.md)，当前仓库可见的实现是：
 
-- **A 硬件与文字骨架**：BSP 沿用，CJK 字体资产已生成入库（`main/fonts/`，见「字体」节）。
-- **B 只读面板**：四宫格、详情和连接状态的固件代码已写入；0/1/4/5/24/25 会话仍需实机复核。
-- **C 网关决策（主机侧）**：`herdr-restful/backend/app/panel/` 已实现 overview/detail/actions、上下文令牌、终端锁与幂等去重，并有 12 个自动化测试；已对活 Herdr 0.9.0 验证只读路径（注意 herdr `agent.*` 方法参数是 `target`）。真实 CLI 审批端到端仍需验证。
-- **D 设备动作**：确认页、发送/回读状态机及结果未知处理的固件代码已写入；真实 CLI 端到端仍需验证。
+- **A/B 硬件与只读面板**：BSP、CJK 字体、配网二维码、四宫格、详情与连接状态已有固件实现；显示芯片、触摸、扫码和 0/1/4/5/24/25 会话仍需实机复核。
+- **C/D 网关决策与设备动作**：相邻 `herdr-restful` 已实现 overview/detail/actions/events、上下文令牌、终端锁与幂等去重；确认页和动作结果状态机已有固件实现。真实 Claude/OpenCode/Pi 审批屏及发送动作仍需端到端验证。
+- **E/F 视觉与运行时设置**：开机四格动效、AXP2101 电量显示、分组设置与 NVS 持久化、临时热点编辑连接和继续提示词已落地。连接编辑目前通过软重启切换热点；设置滑杆尚未做 500 ms NVS 写入合并。
+- **G 声音**：固件使用 ES8311/I2S 播放固定 Herdr `request`/`done` 素材；主机事件 API 当前按状态转移产生近似通知。扬声器焊接、引脚、音量和实际触发时机须在真机与 Herdr 主机上验收。
 
-E（视觉/稳定性）、F（运行时设置）、G（Herdr 同款声音）与真实 CLI 适配器样本需在真机与实机主机上继续验收。当前固件**没有**声音播放和热设置功能；设置页目前只是静态卡片。**编译通过不等于产品完成。**
+GitHub Actions 用 ESP-IDF 6.1 编译固件。**编译通过不等于产品完成**；目前没有成品硬件测量结果，也不能宣称事件音与 Herdr 原生通知完全同步。

@@ -67,8 +67,8 @@ void wifi_connect_start(void)
     bool configured = app_config_is_configured();
     bool editing = configured && app_config_take_edit_request();
     if (!configured || editing) {
-        ESP_LOGI(TAG, editing ? "entering temporary connection editor" :
-                 "no WiFi credentials stored, entering provisioning");
+        if (editing) ESP_LOGI(TAG, "entering temporary connection editor");
+        else ESP_LOGI(TAG, "no WiFi credentials stored, entering provisioning");
         provisioning_start(editing);
         return;
     }
@@ -91,7 +91,8 @@ void wifi_connect_start(void)
            strnlen(ac.wifi_ssid, sizeof(sta_config.sta.ssid)));
     memcpy(sta_config.sta.password, ac.wifi_pass,
            strnlen(ac.wifi_pass, sizeof(sta_config.sta.password)));
-    sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta_config.sta.threshold.authmode =
+        ac.wifi_pass[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));

@@ -325,7 +325,8 @@ static esp_err_t handle_save(httpd_req_t *req)
 
     esp_err_t err = app_config_save(&cfg);
     if (err != ESP_OK) {
-        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_status(req, err == ESP_ERR_INVALID_ARG ?
+                              "400 Bad Request" : "500 Internal Server Error");
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         httpd_resp_send(req, ERR_HTML, HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
