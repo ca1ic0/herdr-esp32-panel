@@ -19,15 +19,15 @@ extern "C" {
 /* ---- limits (architecture budget) ------------------------------------ */
 
 #define PANEL_MAX_AGENTS        24
-#define PANEL_TERM_ID_LEN       32
-#define PANEL_PANE_ID_LEN       32
+#define PANEL_TERM_ID_LEN       64
+#define PANEL_PANE_ID_LEN       64
 #define PANEL_AGENT_LEN         24
 #define PANEL_NAME_LEN          48
 #define PANEL_LABEL_LEN         32
 #define PANEL_STATUS_STR_LEN    24
 #define PANEL_UPDATED_LEN       32
-#define PANEL_SERVER_ID_LEN     48
-#define PANEL_TOKEN_LEN         96
+#define PANEL_SERVER_ID_LEN     96
+#define PANEL_TOKEN_LEN         1025  /* gateway ActionRequest max_length=1024 */
 #define PANEL_SUMMARY_LEN       160
 #define PANEL_IMPACT_LEN        160
 #define PANEL_PROMPT_LEN        192

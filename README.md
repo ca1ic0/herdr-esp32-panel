@@ -77,7 +77,7 @@ idf.py -p PORT flash monitor
 
 ## 字体
 
-`main/fonts/` 内是预生成的 CJK 位图字体（GB2312 一级汉字 3755 字 + 常用标点，16/20/24px），由 `tools/fonts/make_cjk_fonts.sh` 用 lv_font_conv 从 Noto Sans CJK SC 光栅化而来，作为 Montserrat 的 LVGL fallback 链生效。重新生成需要 node/npx 与 `tools/fonts/NotoSansCJKsc-Regular.otf`（不随仓库分发）。Contains rasterized glyphs from Noto Sans CJK SC, licensed under the SIL Open Font License 1.1.
+`main/fonts/` 内是预生成的 CJK 位图字体（GB2312 一级汉字 3755 字 + 常用标点，16/20/24px），由 `tools/fonts/make_cjk_fonts.sh` 用 lv_font_conv 从 Noto Sans CJK SC 光栅化而来，作为 Montserrat 的 LVGL fallback 链生效。重新生成需要 node/npx 与 `tools/fonts/NotoSansCJKsc-Regular.otf`（不随仓库分发）。字形采用 SIL Open Font License 1.1，许可证文本见 `tools/fonts/OFL.txt`。
 
 ## 配网
 

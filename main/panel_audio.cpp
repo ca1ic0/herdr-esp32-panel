@@ -22,10 +22,11 @@ static volatile uint8_t s_desired_volume = 50;
 static i2s_chan_handle_t s_tx;
 static esp_codec_dev_handle_t s_codec;
 
-extern const uint8_t done_pcm_start[] asm("_binary_assets_sounds_done_pcm_start");
-extern const uint8_t done_pcm_end[] asm("_binary_assets_sounds_done_pcm_end");
-extern const uint8_t request_pcm_start[] asm("_binary_assets_sounds_request_pcm_start");
-extern const uint8_t request_pcm_end[] asm("_binary_assets_sounds_request_pcm_end");
+/* ESP-IDF 6.1 embeds with basename-derived symbols (done.pcm -> done_pcm). */
+extern const uint8_t done_pcm_start[] asm("_binary_done_pcm_start");
+extern const uint8_t done_pcm_end[] asm("_binary_done_pcm_end");
+extern const uint8_t request_pcm_start[] asm("_binary_request_pcm_start");
+extern const uint8_t request_pcm_end[] asm("_binary_request_pcm_end");
 
 static bool init_codec(void)
 {

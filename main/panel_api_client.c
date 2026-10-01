@@ -142,6 +142,13 @@ static void copy_str(cJSON *obj, const char *key, char *dst, size_t dst_len)
     }
 }
 
+static bool string_fits(cJSON *obj, const char *key, size_t dst_len)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsString(item) && item->valuestring != NULL &&
+           strlen(item->valuestring) < dst_len;
+}
+
 static bool check_schema(cJSON *root)
 {
     cJSON *sv = cJSON_GetObjectItemCaseSensitive(root, "schema_version");
@@ -162,6 +169,11 @@ static panel_http_result_t parse_overview(const char *json, panel_overview_t *ou
     memset(out, 0, sizeof(*out));
     out->schema_version = 1;
     out->valid = true;
+
+    if (!string_fits(root, "server_id", sizeof(out->server_id))) {
+        cJSON_Delete(root);
+        return PANEL_HTTP_PROTO;
+    }
 
     copy_str(root, "server_id", out->server_id, sizeof(out->server_id));
 
@@ -187,6 +199,11 @@ static panel_http_result_t parse_overview(const char *json, panel_overview_t *ou
     cJSON_ArrayForEach(item, agents) {
         if (out->count >= PANEL_MAX_AGENTS) break;
         panel_agent_card_t *c = &out->agents[out->count];
+        if (!string_fits(item, "terminal_id", sizeof(c->terminal_id)) ||
+            !string_fits(item, "pane_id", sizeof(c->pane_id))) {
+            cJSON_Delete(root);
+            return PANEL_HTTP_PROTO;
+        }
         copy_str(item, "terminal_id", c->terminal_id, sizeof(c->terminal_id));
         if (c->terminal_id[0] == '\0') continue;
 
@@ -250,6 +267,16 @@ static panel_http_result_t parse_detail(const char *json, uint32_t epoch,
     out->valid = true;
     out->selection_epoch = epoch;
 
+    cJSON *pending = cJSON_GetObjectItemCaseSensitive(root, "pending");
+    if (!string_fits(root, "server_id", sizeof(out->server_id)) ||
+        !string_fits(root, "terminal_id", sizeof(out->terminal_id)) ||
+        !string_fits(root, "pane_id", sizeof(out->pane_id)) ||
+        (cJSON_IsObject(pending) &&
+         !string_fits(pending, "context_token", sizeof(out->pending.context_token)))) {
+        cJSON_Delete(root);
+        return PANEL_HTTP_PROTO;
+    }
+
     copy_str(root, "server_id", out->server_id, sizeof(out->server_id));
     copy_str(root, "terminal_id", out->terminal_id, sizeof(out->terminal_id));
     copy_str(root, "pane_id", out->pane_id, sizeof(out->pane_id));
@@ -271,7 +298,6 @@ static panel_http_result_t parse_detail(const char *json, uint32_t epoch,
         }
     }
 
-    cJSON *pending = cJSON_GetObjectItemCaseSensitive(root, "pending");
     if (cJSON_IsObject(pending)) {
         cJSON *kind = cJSON_GetObjectItemCaseSensitive(pending, "kind");
         if (cJSON_IsString(kind) && kind->valuestring != NULL) {
@@ -315,7 +341,7 @@ panel_http_result_t panel_api_fetch_detail(const char *terminal_id,
 {
     if (terminal_id == NULL || out == NULL) return PANEL_HTTP_ERR;
 
-    char path[96];
+    char path[192];
     snprintf(path, sizeof(path), "/api/v1/panel/agents/%s", terminal_id);
 
     static char resp[PANEL_API_DETAIL_CAP];
@@ -422,7 +448,7 @@ panel_http_result_t panel_api_post_action(const panel_action_cmd_t *cmd,
     const char *act = action_to_str(cmd->action);
     if (act == NULL) return PANEL_HTTP_ERR;
 
-    char path[96];
+    char path[192];
     snprintf(path, sizeof(path), "/api/v1/panel/agents/%s/actions", cmd->terminal_id);
 
     char prompt_esc[2 * PANEL_PROMPT_LEN];
@@ -445,7 +471,7 @@ panel_http_result_t panel_api_post_action(const panel_action_cmd_t *cmd,
         prompt_esc[j] = '\0';
     }
 
-    char body[512];
+    char body[2048];
     int body_len;
     if (cmd->prompt[0] != '\0') {
         body_len = snprintf(body, sizeof(body),
@@ -518,6 +544,10 @@ panel_http_result_t panel_api_fetch_events(const char *after,
         return PANEL_HTTP_PROTO;
     }
     memset(out, 0, sizeof(*out));
+    if (!string_fits(root, "server_id", sizeof(out->server_id))) {
+        cJSON_Delete(root);
+        return PANEL_HTTP_PROTO;
+    }
     copy_str(root, "server_id", out->server_id, sizeof(out->server_id));
     copy_str(root, "latest_cursor", out->latest_cursor, sizeof(out->latest_cursor));
     copy_str(root, "next_cursor", out->next_cursor, sizeof(out->next_cursor));

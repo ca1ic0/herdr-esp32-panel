@@ -16,11 +16,11 @@
 
 | 当前状态（代码位置） | 剩余缺口 | 目标 |
 | --- | --- | --- |
-| [`app_config.c`](../main/app_config.c) 保存 Wi-Fi/主机/token，检查 `nvs_commit` | 没有偏好 schema、版本迁移或音量/亮度/免打扰持久化 | 配置服务增加版本化偏好和按字段合并的原子保存；凭据与普通偏好分开清除。 |
-| [`app_main.cpp`](../main/app_main.cpp) 仅启动时用 Kconfig 设置背光 | 运行中不能改亮度或静置降亮 | 显示驱动接受最新偏好快照，在 UI 外异步应用；重启从 NVS 恢复。 |
-| [`ui_panel.c`](../main/ui_panel.c) 设置页为静态信息卡，存在未接线的 `s_brightness`、`s_reduce_motion` | 用户不能实际更改或保存设置 | 快捷设置 + 声音/显示/会话子页；即时预览、保存结果与失败回滚。 |
-| [`panel_store.h`](../main/panel_store.h) 有 `SET_DISPLAY_PREF` 命令，`panel_worker.c` 当前不保存它 | UI 即使投递也没有持久化结果 | 扩成版本化 `SET_PREF`，worker/config service 返回带 generation 的结果。 |
-| [`panel_api_client.c`](../main/panel_api_client.c) 只有 overview/detail/action；板级代码未接音频 | 无通知游标，无法判断一次性响铃，也不能播放 | 网关加 `/events`；固件加事件过滤器、音频队列和 ES8311/I2S TX 驱动。 |
+| [`app_config.c`](../main/app_config.c) 保存 Wi-Fi/主机/token；[`panel_prefs.c`](../main/panel_prefs.c) 按字段保存版本化偏好 | 首版偏好无旧 schema 迁移用例；滑杆连续松手尚未合并写入 | 凭据与普通偏好继续分开清除；加入 500 ms 写入合并及迁移测试。 |
+| [`app_main.cpp`](../main/app_main.cpp) 从 NVS 恢复亮度，UI 可预览并按闲置时间降亮 | 实际屏幕亮度曲线与唤醒时序未在真机测量 | 用板上触摸及电源测量验证。 |
+| [`ui_panel.c`](../main/ui_panel.c) 有快捷设置与声音/显示/会话子页、即时预览和保存反馈 | 长继续提示词、连接编辑尚无手机入口 | 加受限的临时配置热点和编辑页。 |
+| [`panel_store.h`](../main/panel_store.h) 有按字段 `SET_PREF` 命令，worker 持久化成功后发结果 | 多个连续保存结果的 UI 文案需要压力测试 | 用 edit_id 只显示当前值对应的结果，失败回滚。 |
+| [`panel_api_client.c`](../main/panel_api_client.c) 拉 `/events` 游标；[`panel_audio.cpp`](../main/panel_audio.cpp) 播放固定 PCM | 网关事件为状态转移近似；codec、功放及扬声器未实测 | 真机验证声音与故障降级，原生 Herdr 通知源可得时再替换近似事件。 |
 | [`provisioning.c`](../main/provisioning.c) 有 WPA2 首次配网表单 | 运行中编辑长提示词或连接参数仍需明确入口 | 设置→连接/会话启动临时配置热点，保存后重连/热更新，不清空其它偏好。 |
 
 这些是代码审查结论，尚未通过真机性能测试；最终用构建报告和运行时水位确认。
@@ -145,7 +145,7 @@ main/
 | 配网 HTTP/DNS task | 临时 AP/网页 | 字段校验、交给 config service 保存 | 直接改 UI/worker 全局状态；在 HTTP handler 里长时间等待重启。 |
 | `audio_task` | ES8311 codec、I2S TX、播放队列和音量 | 从事件过滤器接收短枚举命令、接收已接受偏好快照、分块播放 flash PCM | HTTP、LVGL、NVS、持有 store 锁时阻塞写 I2S。 |
 
-保留两个有界入口：`action_q` 容量 1，只收已确认的 `ACTION`；`control_q` 容量 4，收 `OPEN_DETAIL`、`REFRESH`、`RECONNECT`、版本化 `SET_PREF`。`ACTION` 带 `server_id`、`terminal_id`、`context_token`、动作和可选提示词；worker 在取出时生成一次 `request_id` 并保存到动作状态，直到结果确定或标记未知。命令对象用固定大小并标注最大长度。UI 投递使用 **0 ms** 超时；队列满立即显示“忙，请稍后”。重复的 `OPEN_DETAIL/REFRESH` 可合并；设置命令按字段掩码合并最新值、返回 generation 和保存结果，不能把旧完整快照覆盖新修改。worker 每次调度先检查 `action_q`，然后处理控制请求和到期轮询；`ACTION` 不合并也不重排。配网 HTTP handler 在配置服务完成 NVS 提交后只发重连事件，不直接改 UI 全局变量。
+保留两个有界入口：`action_q` 容量 1，只收已确认的 `ACTION`；`control_q` 容量 4，收 `OPEN_DETAIL`、`REFRESH`、`RECONNECT`、`SET_PREF`。`ACTION` 带 `terminal_id`、`context_token`、动作和可选提示词；token 本身绑定 `server_id`，worker 在取出时生成一次 `request_id` 并保存到动作状态，直到结果确定或标记未知。命令对象用固定大小并标注最大长度；当前 `context_token` 最多 1024 字节，超过上限必须拒绝，不能截断后发送。UI 投递使用 **0 ms** 超时；队列满立即显示“忙，请稍后”。设置命令按字段合并到最近一次已保存值，返回 edit_id 和保存结果，不能把旧完整快照覆盖新修改。worker 每次调度先检查 `action_q`，然后处理控制请求和到期轮询；`ACTION` 不合并也不重排。当前配网 HTTP handler 保存后重启设备；运行中的临时编辑热点仍待实现。
 
 设备同一时刻只允许**一个全局未决动作**：确认后先用原子状态占位，再入 `action_q`；入队失败立即释放占位。worker 完成或标为 `uncertain` 后释放占位，不能因为队列已经被取空就接受第二个动作。重新操作必须重新打开最新详情，不能把旧确认页当作第二次提交入口。
 
