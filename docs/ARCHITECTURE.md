@@ -1,30 +1,29 @@
 # Herdr 面板系统架构设计
 
-版本：v1 草案（2026-09-30）。本文定义**目标架构**和从现有原型迁移的步骤，配合[产品逻辑](PRODUCT_LOGIC.md)、[UI 设计](UI_DESIGN.md)、[验收清单](ACCEPTANCE.md)使用。硬件仍按仓库现有 ESP32-C6 / 480×480 触摸 AMOLED 假设；实际板卡待核实。
+版本：v2 草案（2026-10-01）。本文定义**目标架构**和当前代码剩余的实现工作，配合[产品逻辑](PRODUCT_LOGIC.md)、[UI 设计](UI_DESIGN.md)、[运行时设置与声音](SETTINGS_AUDIO.md)、[验收清单](ACCEPTANCE.md)使用。硬件仍按仓库现有 ESP32-C6 / 480×480 触摸 AMOLED 假设；实际板卡待核实。
 
 ## 1. 结论与架构原则
 
-现有“LVGL 任务 + 一个网络任务 + Herdr REST 包装层”的方向可以保留。问题在于**职责边界不清**：固件拿原始 pane、自己把状态与动作混在一起、直接发终端文本；多个全局缓冲和 `volatile` 标志让 UI/网络线程交换数据；审批没有现场校验、去重和回读。产品级架构采用：
+现有“LVGL 任务 + 一个网络任务 + Herdr panel 网关”的方向可以保留。`b430005` 已拆出 `panel_api_client`、`panel_store`、`panel_worker`，并接入语义动作；**下一步主要缺口是运行时设置的单一属主、真实音频链路及通知事件来源**。产品级架构采用：
 
 1. **主机做语义，设备做交互。** Herdr 和各 CLI 的审批选项由主机侧 panel 网关解析；ESP32 只渲染网关给出的状态/选项并提交语义动作。
 2. **设备只有一个 HTTP 执行者、一个 LVGL 所有者。** HTTP 请求和 JSON 解析只在 `net_task`；LVGL 对象只在 LVGL 任务。通过有界队列和短暂持锁的快照交换数据。
 3. **动作按事务思考，承认终端没有事务。** 网关在发键前复验当前提示并记录请求 ID；网络结果不明时不自动重试。`accepted` 与“CLI 已执行”是两个不同结果。
 4. **先测内存，再调动画和吞吐。** ESP32-C6 为单核，所有任务最终在同一核上运行；固定核心编号不能改善并行度。显示部分用小块刷新缓冲，不分配整帧。[ESP-IDF FreeRTOS](https://docs.espressif.com/projects/esp-idf/en/v5.1/esp32c6/api-reference/system/freertos.html) · [厂商硬件资料](https://docs.waveshare.com/ESP32-C6-Touch-AMOLED-2.16)
+5. **设置与音频各有所有者。** 配置服务持久化偏好，UI 提供即时预览，音频任务独占 ES8311/I2S。网关提供一次性通知事件，设备不从状态快照反复猜声音。
 
 ## 2. 现有代码评估
 
-| 现状（代码位置） | 影响 | 目标 |
+| 当前状态（代码位置） | 剩余缺口 | 目标 |
 | --- | --- | --- |
-| [`app_main.cpp`](../main/app_main.cpp) 中网络任务既发动作又轮询列表，HTTP 最长等 8 秒 | 某个请求阻塞会延迟所有其它请求；UI 只得到笼统 `sent` | 仍保留一个网络任务，但用队列调度、分请求超时、动作结果状态机。 |
-| [`panel_state.c`](../main/panel_state.c) 的输出、toast、连接文字只有 `volatile bool dirty`，没有一致的锁/消息所有权 | 字符串写入和 UI 读取可能交错；dirty 标志可能丢事件 | 快照 store + UI 事件队列；禁止跨任务直接读写这些全局字符数组。 |
-| [`ui_panel.c`](../main/ui_panel.c) 的 `s_selected` 是列表下标；输出结果不带请求/终端身份 | 列表变动后可能显示或操作另一会话；旧输出可能落入新详情 | 选中 `terminal_id`；详情请求记录 `server_id`、`terminal_id`、`selection_epoch`，过期响应丢弃。 |
-| [`herdr_model.h`](../main/herdr_model.h) 的 24 个记录约 7.5 KB；网络任务有同尺寸局部 `snap`，栈仅 12 KB | 大局部变量占掉大量任务栈；UI、全局、网络至少三份快照 | 网络解析目标放固定静态缓冲；型号字段裁剪；栈按水位测量。 |
-| [`herdr_client.c`](../main/herdr_client.c) 每请求分配 24 KB 响应缓冲，再建 cJSON 树 | 峰值堆内存与碎片化不可控；超长响应被静默截断 | 网关限制响应；设备按 Content-Length/实际长度做显式上限检查，复用有界缓冲或流式解析。 |
-| [`wifi_connect.c`](../main/wifi_connect.c) 与 [`app_config.c`](../main/app_config.c) 都初始化 NVS；保存配置忽略部分 NVS 返回值 | 启动/保存路径难定位失败，可能错误显示配置成功 | 单一系统初始化；配置验证、`nvs_commit` 返回值和重启流程统一归 `config_service`。 |
-| [`provisioning.c`](../main/provisioning.c) 是开放热点 | 家用 Wi-Fi 密码经开放 AP 的 HTTP 页面输入 | 随机临时 WPA2 热点密码，仅在屏幕/配网二维码展示；网关凭据不回显。 |
-| 固件通过 pane `send_text` 发送字面量 `allow`/`deny`/`continue` | 不适配不同 CLI 的交互界面；`blocked` 可能是问题而非审批 | 引入带上下文校验的 `/api/v1/panel` 语义网关。 |
+| [`app_config.c`](../main/app_config.c) 保存 Wi-Fi/主机/token，检查 `nvs_commit` | 没有偏好 schema、版本迁移或音量/亮度/免打扰持久化 | 配置服务增加版本化偏好和按字段合并的原子保存；凭据与普通偏好分开清除。 |
+| [`app_main.cpp`](../main/app_main.cpp) 仅启动时用 Kconfig 设置背光 | 运行中不能改亮度或静置降亮 | 显示驱动接受最新偏好快照，在 UI 外异步应用；重启从 NVS 恢复。 |
+| [`ui_panel.c`](../main/ui_panel.c) 设置页为静态信息卡，存在未接线的 `s_brightness`、`s_reduce_motion` | 用户不能实际更改或保存设置 | 快捷设置 + 声音/显示/会话子页；即时预览、保存结果与失败回滚。 |
+| [`panel_store.h`](../main/panel_store.h) 有 `SET_DISPLAY_PREF` 命令，`panel_worker.c` 当前不保存它 | UI 即使投递也没有持久化结果 | 扩成版本化 `SET_PREF`，worker/config service 返回带 generation 的结果。 |
+| [`panel_api_client.c`](../main/panel_api_client.c) 只有 overview/detail/action；板级代码未接音频 | 无通知游标，无法判断一次性响铃，也不能播放 | 网关加 `/events`；固件加事件过滤器、音频队列和 ES8311/I2S TX 驱动。 |
+| [`provisioning.c`](../main/provisioning.c) 有 WPA2 首次配网表单 | 运行中编辑长提示词或连接参数仍需明确入口 | 设置→连接/会话启动临时配置热点，保存后重连/热更新，不清空其它偏好。 |
 
-这些是代码审查结论，尚未通过真机性能测试；内存数字是从当前结构体/配置推算的量级，最终用构建报告和运行时水位确认。
+这些是代码审查结论，尚未通过真机性能测试；最终用构建报告和运行时水位确认。
 
 ## 3. 部署与信任边界
 
@@ -33,6 +32,8 @@ flowchart LR
     Phone[手机配网页] -- 首次配网 --> AP[ESP32 SoftAP]
     UI[ESP32: LVGL UI] <--> Store[设备状态存储与消息队列]
     Store <--> Net[ESP32: 唯一 HTTP 任务]
+    Net --> Events[通知事件过滤器]
+    Events --> Audio[ESP32: audio_task / ES8311 / I2S]
     Net -->|HTTPS 或受控局域网 HTTP + Bearer| Gateway[主机: panel 网关]
     Gateway <--> Rest[herdr-restful]
     Rest -- 本地 Unix socket --> Herdr[Herdr server]
@@ -42,7 +43,7 @@ flowchart LR
 - 设备不能直接连 Herdr Unix socket。`herdr-restful` 负责原始 Herdr REST，新增 panel 网关负责面板特有的读模型与安全动作；两者可部署在同一个 FastAPI 进程，别为网关再起一个不必要的 Python 服务。
 - Wi-Fi/网络边界和 CLI 决策边界分开。网关靠鉴权拒绝未授权客户端，靠现场校验拒绝过期动作；设备遗失时必须能撤销它的 token。主机管理员通过网关命令生成每设备独立的随机令牌，手机配网页录入，网关仅保存令牌校验值。持有有效 token 的人仍可对真实当前提示作决策，所以“藏住按钮”不是服务端授权。
 - 远程主机的发布方式必须明确：优先经过证书验证的 HTTPS 或受控 VPN/隧道；纯 HTTP 仅限可信局域网，不可公网直连。部署说明须包含设备可达的 URL、令牌生成/吊销、网关只启用一个 worker 进程、Herdr socket 权限以及断网后的故障显示。
-- 面板对外只有手机配网时的临时 HTTP 服务。配网结束应关闭 SoftAP、DNS、HTTP server 与临时密码的内存副本；正常运行时不开放设备控制端口。
+- 面板对外只有首次配网或用户从屏幕显式打开“扫码编辑连接/继续提示词”时的临时 HTTP 服务，最长 5 分钟。关闭页面或超时后关闭 SoftAP、DNS、HTTP server 与临时密码的内存副本；平时不开放设备控制端口。
 - v1 以**一个 Herdr 主机**为配置单位。切换主机要清除所有 agent 缓存、待处理 token、未完成确认。多主机聚合是单独版本需求，不在 UI 上制造混合列表。
 
 ## 4. 主机端模块（新增到 `herdr-restful`）
@@ -57,6 +58,7 @@ backend/app/panel/
   adapters/opencode.py   OpenCode 可见审批界面适配
   adapters/pi.py         仅已知审批扩展的 Pi 适配
   idempotency.py         request_id 持久化与终端级互斥
+  events.py              Herdr 通知事件/可靠状态转移、游标、保留与缺口
 ```
 
 ### 4.1 读取路径
@@ -94,6 +96,8 @@ sequenceDiagram
 
 鉴权在路由最外层完成。拒绝未认证的 `overview/detail/action`，至少给每台设备独立 token；未来可撤销单设备 token。网关不向设备暴露 raw pane `send_text`、任意按键、关闭 pane 或 Auto 模式切换。原有 `herdr-restful` 通用 API 应只监听 loopback 或置于同一受保护网关后，避免绕过 panel 限制。
 
+通知事件路由也必须鉴权。`events.py` 优先接 Herdr 原生通知来源；如没有可用事件源，只按同一 agent 的可靠状态转移生成 `source=state_transition` 近似事件。持有有序游标、保留窗口和缺口检测；不把每个 `blocked/done` 快照当成新通知。设备首次连接、断线恢复和 `server_id` 改变时只建立最新基线，不补播历史。具体响应和规则见 [SETTINGS_AUDIO.md](SETTINGS_AUDIO.md)。
+
 ### 4.3 Agent 适配接口
 
 ```text
@@ -121,6 +125,10 @@ main/
   panel_model.h         设备专用有界数据结构、状态与动作枚举
   panel_store.c         快照发布/读取；不包含 LVGL 对象
   panel_worker.c        请求队列调度、轮询、退避、动作生命周期
+  panel_prefs.c          版本化运行时偏好、NVS 持久化与迁移
+  panel_events.c         /events 游标、过滤、去重及静音规则
+  audio_player.c         audio_q、ES8311/I2S TX 唯一属主、播放与故障降级
+  assets/sounds/         固定版本的 Herdr 两类声音及来源清单
   ui_screens.c          LVGL 页面和局部刷新
   ui_controller.c       导航/确认/手势；向 worker 投递命令
 ```
@@ -135,8 +143,9 @@ main/
 | `panel_worker` FreeRTOS task | HTTP handle、网络定时器、响应解析工作缓冲、动作 `request_id` | 读取 config 副本、调用 config service 保存设置、发布 store、投递 UI 结果事件 | 直接调用 LVGL；从 UI 全局字符数组读数据。 |
 | Wi-Fi/ESP event callback | 链路事件 | 设置 EventGroup 位或投递简短事件 | HTTP、复杂 JSON、LVGL、长时间阻塞。 |
 | 配网 HTTP/DNS task | 临时 AP/网页 | 字段校验、交给 config service 保存 | 直接改 UI/worker 全局状态；在 HTTP handler 里长时间等待重启。 |
+| `audio_task` | ES8311 codec、I2S TX、播放队列和音量 | 从事件过滤器接收短枚举命令、接收已接受偏好快照、分块播放 flash PCM | HTTP、LVGL、NVS、持有 store 锁时阻塞写 I2S。 |
 
-用两个有界入口：`action_q` 容量 1，只收已确认的 `ACTION`；`control_q` 容量 4，收 `OPEN_DETAIL`、`REFRESH`、`RECONNECT`、`SET_DISPLAY_PREF`。`ACTION` 带 `server_id`、`terminal_id`、`context_token`、动作和可选提示词；worker 在取出时生成一次 `request_id` 并保存到动作状态，直到结果确定或标记未知。命令对象用固定大小并标注最大长度。UI 投递使用 **0 ms** 超时；队列满立即显示“忙，请稍后”，不能像现有代码那样在触摸回调中等待 500 ms。重复的 `OPEN_DETAIL/REFRESH` 合并，亮度设置只保留最新值。worker 每次调度先检查 `action_q`，然后处理控制请求和到期轮询；`ACTION` 不合并也不重排。配网 HTTP handler 在配置服务完成 NVS 提交后只发重连事件，不直接改 UI 全局变量。
+保留两个有界入口：`action_q` 容量 1，只收已确认的 `ACTION`；`control_q` 容量 4，收 `OPEN_DETAIL`、`REFRESH`、`RECONNECT`、版本化 `SET_PREF`。`ACTION` 带 `server_id`、`terminal_id`、`context_token`、动作和可选提示词；worker 在取出时生成一次 `request_id` 并保存到动作状态，直到结果确定或标记未知。命令对象用固定大小并标注最大长度。UI 投递使用 **0 ms** 超时；队列满立即显示“忙，请稍后”。重复的 `OPEN_DETAIL/REFRESH` 可合并；设置命令按字段掩码合并最新值、返回 generation 和保存结果，不能把旧完整快照覆盖新修改。worker 每次调度先检查 `action_q`，然后处理控制请求和到期轮询；`ACTION` 不合并也不重排。配网 HTTP handler 在配置服务完成 NVS 提交后只发重连事件，不直接改 UI 全局变量。
 
 设备同一时刻只允许**一个全局未决动作**：确认后先用原子状态占位，再入 `action_q`；入队失败立即释放占位。worker 完成或标为 `uncertain` 后释放占位，不能因为队列已经被取空就接受第二个动作。重新操作必须重新打开最新详情，不能把旧确认页当作第二次提交入口。
 
@@ -162,7 +171,7 @@ ActionState:  unavailable | ready | confirming | sending | delivered | observed 
 
 ### 5.3 网络调度
 
-- 设备只使用短轮询：`overview` 每 3 秒，当前 `detail` 每 2 秒；收到 Wi-Fi 重连时立即全量拉取。v1 不在 ESP32 保持 SSE 长连接。单核+小屏没有必要再做第二条复杂事件流。
+- 设备只使用短轮询：`overview` 默认每 3 秒、可在 2/3/5/10 秒间动态调整；当前 `detail` 每 2 秒；`events` 每 2 秒取一次。收到 Wi-Fi 重连时立即全量拉取状态，声音事件先建立新游标基线。v1 不在 ESP32 保持 SSE 长连接。
 - 唯一 HTTP task 优先处理已确认动作，再处理详情刷新，最后列表定时刷新。一次只执行一个 HTTP 请求；列表/详情 HTTP 超时建议 2 秒，动作超时建议 5 秒。阻塞 API 在网络任务内可接受；它不能阻塞 LVGL。配置变化或 Wi-Fi 断开时关闭旧连接和丢弃旧响应。
 - `esp_http_client` 可由网络任务持有并复用 handle/持久连接，所有请求串行化；服务端/网络断开时重建。官方说明同一 handle 可复用连接，但不能同时从两处调用。[ESP HTTP Client](https://docs.espressif.com/projects/esp-idf/en/stable/esp32c6/api-reference/protocols/esp_http_client.html)
 - 响应带 `schema_version`，未知版本进入“协议不兼容”状态，禁止动作。认证失败单独显示“凭据失效”，不当作 0 个会话。超时/断线指数退避到 15 秒；用户点“刷新连接”可触发一次立即尝试，但仍受防抖限制。
@@ -171,7 +180,7 @@ ActionState:  unavailable | ready | confirming | sending | delivered | observed 
 
 ESP32-C6 片上 RAM 紧张。RGB565 480×480 整帧约 **450 KiB**；当前显示缓冲配置为 100 行，即**单块约 93.75 KiB**，若 adapter 分配两块则翻倍。由于具体 adapter 分配行为需在实际组件版本中确认，不能先假定有双缓冲或 PSRAM。目标是 24–40 行局部刷新缓冲（每块约 22.5–37.5 KiB），动画只改小区域；触摸和 Wi-Fi 同时运行时以真机测量决定最终行数。
 
-设备专用 API 响应目标：`overview ≤ 12 KiB`、`detail ≤ 6 KiB`、`action ≤ 1 KiB`，主机负责截断非关键显示文字并显式标 `truncated`；若审批影响内容被截断则 `choices=[]`。设备拒绝超上限响应，不可静默解析前半截。最多缓存 24 个简化 agent，输出仅缓存当前详情 12 行，不缓存每个 pane 的原始终端全文。两份快照、HTTP 响应缓冲、LVGL 缓冲的峰值须单独测量，避免请求期间瞬时 OOM。
+设备专用 API 响应目标：`overview ≤ 12 KiB`、`detail ≤ 6 KiB`、`events ≤ 4 KiB`、`action ≤ 1 KiB`，主机负责截断非关键显示文字并显式标 `truncated`；若审批影响内容被截断则 `choices=[]`。设备拒绝超上限响应，不可静默解析前半截。最多缓存 24 个简化 agent，输出仅缓存当前详情 12 行，不缓存每个 pane 的原始终端全文。两份快照、HTTP 响应缓冲、LVGL 缓冲与音频分块缓冲的峰值须单独测量，避免请求期间瞬时 OOM。
 
 为发布版记录：`heap_caps_get_free_size(MALLOC_CAP_8BIT)`、`heap_caps_get_minimum_free_size()`、`heap_caps_get_largest_free_block()`、UI/worker/DNS 栈水位与失败分配次数。验收时至少覆盖联网、24 会话、中文长文本、QR、HTTPS、动作、掉线重连的峰值；最小剩余堆目标 ≥ 32 KiB，最大连续块仍大于最大单次申请量加 8 KiB。若达不到，先缩小显示缓冲/JSON 模型并减少复制，不能简单增大任务栈或隐瞒分配失败。[ESP-IDF RAM 指南](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c6/api-guides/performance/ram-usage.html) · [堆水位 API](https://docs.espressif.com/projects/esp-idf/en/latest/esp32c6/api-reference/system/mem_alloc.html)
 
@@ -186,7 +195,7 @@ GATEWAY_CHECK 失败 → GATEWAY_OFFLINE / HERDR_DEGRADED（保留旧快照）
 ONLINE 掉线 → 离线标记 + 禁止动作 → 退避重连 → 全量刷新
 ```
 
-NVS 仅初始化一次；配置服务负责默认值、用户值、验证、提交、读回、版本迁移与清除。配置保存失败不能重启或报告成功。设备正常模式不保存会话/待处理 token 到 NVS。Wi-Fi 密码与网关 token 不打印到串口，也不传进 LVGL label；显示端最多看到 SSID、服务器主机名和凭据是否有效。
+NVS 仅初始化一次；配置服务负责默认值、用户值、验证、提交、读回、版本迁移与清除。偏好与凭据分键/命名空间存储：重新配网只清凭据，恢复设置默认只清偏好；两项都有二次确认。设置保存失败恢复上一个已提交快照，不能报告成功。设备正常模式不保存会话/待处理 token 或通知游标到 NVS。Wi-Fi 密码与网关 token 不打印到串口，也不传进 LVGL label；显示端最多看到 SSID、服务器主机名和凭据是否有效。运行时配置流和音频事件状态机见 [SETTINGS_AUDIO.md](SETTINGS_AUDIO.md)。
 
 网关突然重启或 Herdr 会话连续性丢失会改变 `server_id`；设备丢弃全部旧请求与缓存。设备自身重启后不恢复未决动作。固件 watchdog 的诊断应指出任务与最近 HTTP 阶段，不能通过自动重发动作“补救”超时。
 
@@ -197,5 +206,6 @@ NVS 仅初始化一次；配置服务负责默认值、用户值、验证、提�
 3. **实现主机适配器与动作日志。** 先让不支持的 agent/提示返回空 `choices`，再逐个加入真实 CLI 提示样本。完成终端锁、上下文 token、持久请求去重。
 4. **接入设备确认与结果状态机。** 动作只通过新的 panel API；删掉或完全禁用旧的三条字面量 `send_text` 按钮及对应 Kconfig 默认值。
 5. **优化 LVGL、内存与部署。** 加中文字体和小区域动效；用真机峰值数据调整缓冲；验证配网热点与网关鉴权。
+6. **运行时设置与声音。** 先交付配置 schema、NVS 保存回滚与屏幕热调；再接主机 `/events` 游标和去重；最后按厂商示例验证本板音频引脚、固定 Herdr 音频资产、ES8311/I2S 播放及静音/免打扰。无扬声器的板卡只可验收视觉与“音频不可用”降级，不能声称声音完成。
 
 每切片的证明材料：接口样本/自动化测试、真机串口日志（脱敏）、内存/栈水位、关键页面截图。架构验收的核心断言：**UI 线程无 HTTP，网络线程无 LVGL，任何旧上下文不会发键，任何结果未知的动作不会自动重发。**
