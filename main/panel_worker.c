@@ -166,7 +166,7 @@ static void run_action(panel_cmd_t *cmd)
     if (hr != PANEL_HTTP_OK) {
         result.state = PANEL_ACTION_UNCERTAIN;
         snprintf(result.request_id, sizeof(result.request_id), "%s", ac.request_id);
-        snprintf(result.message, sizeof(result.message), "Result unknown");
+        snprintf(result.message, sizeof(result.message), "结果未知");
     }
 
     s_action_state = result.state;
@@ -196,7 +196,7 @@ static void check_delivered_timeout(int64_t now_ms)
     panel_action_result_t r = { 0 };
     snprintf(r.request_id, sizeof(r.request_id), "%s", s_action_rid);
     r.state = PANEL_ACTION_UNCERTAIN;
-    snprintf(r.message, sizeof(r.message), "Result unconfirmed");
+    snprintf(r.message, sizeof(r.message), "结果未确认");
     s_action_state = PANEL_ACTION_UNCERTAIN;
     panel_store_release_action();
     post_action_result(&r, s_action_epoch);
@@ -208,8 +208,8 @@ static void poll_overview(int64_t now_ms)
 {
     if (!wifi_is_connected()) {
         s_event_cursor[0] = '\0';
-        panel_store_set_sound_notice("Alerts paused offline");
-        panel_store_set_conn(PANEL_CONN_WIFI_CONNECTING, "Connecting Wi-Fi");
+        panel_store_set_sound_notice("离线期间提醒暂停");
+        panel_store_set_conn(PANEL_CONN_WIFI_CONNECTING, "连接 Wi-Fi");
         s_next_overview_ms = now_ms + 1000;
         return;
     }
@@ -228,15 +228,15 @@ static void poll_overview(int64_t now_ms)
         s_next_overview_ms = now_ms + prefs.overview_interval * 1000;
     } else if (hr == PANEL_HTTP_AUTH) {
         s_event_cursor[0] = '\0';
-        panel_store_set_conn(PANEL_CONN_GATEWAY_OFFLINE, "Auth failed");
+        panel_store_set_conn(PANEL_CONN_GATEWAY_OFFLINE, "鉴权失败");
         s_next_overview_ms = now_ms + 3000;
     } else if (hr == PANEL_HTTP_PROTO) {
         s_event_cursor[0] = '\0';
-        panel_store_set_conn(PANEL_CONN_GATEWAY_OFFLINE, "Protocol mismatch");
+        panel_store_set_conn(PANEL_CONN_GATEWAY_OFFLINE, "协议不匹配");
         s_next_overview_ms = now_ms + 3000;
     } else {
         s_event_cursor[0] = '\0';
-        panel_store_set_conn(PANEL_CONN_GATEWAY_OFFLINE, "Server offline");
+        panel_store_set_conn(PANEL_CONN_GATEWAY_OFFLINE, "服务器离线");
         s_backoff_ms = s_backoff_ms == 0 ? 1000 :
                        (s_backoff_ms * 2 > BACKOFF_MAX_MS ? BACKOFF_MAX_MS : s_backoff_ms * 2);
         s_next_overview_ms = now_ms + s_backoff_ms;
@@ -295,10 +295,10 @@ static void poll_events(int64_t now_ms)
     if (hr != PANEL_HTTP_OK) {
         if (hr == PANEL_HTTP_GONE || hr == PANEL_HTTP_PROTO) {
             ESP_LOGW(TAG, "sound event API unavailable (%d)", (int)hr);
-            panel_store_set_sound_notice("Sound alerts unavailable");
+            panel_store_set_sound_notice("声音提醒不可用");
             s_next_events_ms = now_ms + 30000;
         } else {
-            if (hr == PANEL_HTTP_AUTH) panel_store_set_sound_notice("Alerts auth failed");
+            if (hr == PANEL_HTTP_AUTH) panel_store_set_sound_notice("提醒接口鉴权失败");
             s_next_events_ms = now_ms + EVENTS_PERIOD_MS;
         }
         return;
@@ -310,7 +310,7 @@ static void poll_events(int64_t now_ms)
         return;
     }
     if (batch.gap) {
-        panel_store_set_sound_notice("Alerts may have been missed");
+        panel_store_set_sound_notice("可能遗漏部分提醒");
     } else if (baseline || batch.count > 0) {
         panel_store_set_sound_notice("");
     }
@@ -447,7 +447,7 @@ static void worker_task(void *arg)
                     .config_saved = err == ESP_OK,
                 };
                 snprintf(evt.message, sizeof(evt.message), "%s",
-                         err == ESP_OK ? "Saved" : "Save failed; value restored");
+                         err == ESP_OK ? "已保存" : "保存失败，已恢复原值");
                 if (!panel_store_post_ui_event(&evt)) {
                     s_parked_config_evt = evt;
                     s_parked_config_evt_valid = true;

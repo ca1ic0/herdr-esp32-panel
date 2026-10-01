@@ -201,11 +201,11 @@ static inline panel_agent_state_t panel_agent_state_from_str(const char *s)
 static inline const char *panel_agent_state_name(panel_agent_state_t st)
 {
     switch (st) {
-    case PANEL_AGENT_WORKING: return "Working";
-    case PANEL_AGENT_BLOCKED: return "Blocked";
-    case PANEL_AGENT_DONE:    return "Done";
-    case PANEL_AGENT_IDLE:    return "Idle";
-    default:                  return "Unknown";
+    case PANEL_AGENT_WORKING: return "运行中";
+    case PANEL_AGENT_BLOCKED: return "待处理";
+    case PANEL_AGENT_DONE:    return "已完成";
+    case PANEL_AGENT_IDLE:    return "空闲";
+    default:                  return "未知";
     }
 }
 
@@ -224,37 +224,37 @@ static inline uint32_t panel_agent_state_color(panel_agent_state_t st)
 static inline const char *panel_conn_state_name(panel_conn_state_t st)
 {
     switch (st) {
-    case PANEL_CONN_PROVISIONING:    return "Provisioning";
-    case PANEL_CONN_WIFI_CONNECTING: return "Connecting Wi-Fi";
-    case PANEL_CONN_GATEWAY_OFFLINE: return "Server offline";
-    case PANEL_CONN_HERDR_DEGRADED:  return "Herdr degraded";
-    case PANEL_CONN_ONLINE:          return "Online";
-    default:                         return "Unknown";
+    case PANEL_CONN_PROVISIONING:    return "配网中";
+    case PANEL_CONN_WIFI_CONNECTING: return "连接 Wi-Fi";
+    case PANEL_CONN_GATEWAY_OFFLINE: return "服务器离线";
+    case PANEL_CONN_HERDR_DEGRADED:  return "Herdr 异常";
+    case PANEL_CONN_ONLINE:          return "在线";
+    default:                         return "未知";
     }
 }
 
 static inline const char *panel_action_state_name(panel_action_state_t st)
 {
     switch (st) {
-    case PANEL_ACTION_READY:       return "Ready";
-    case PANEL_ACTION_CONFIRMING:  return "Confirming";
-    case PANEL_ACTION_SENDING:     return "Sending...";
-    case PANEL_ACTION_DELIVERED:   return "Delivered";
-    case PANEL_ACTION_OBSERVED:    return "Done";
-    case PANEL_ACTION_UNCERTAIN:   return "Unknown result";
-    case PANEL_ACTION_STALE:       return "Stale";
-    case PANEL_ACTION_UNSUPPORTED: return "Unsupported";
-    default:                       return "No action";
+    case PANEL_ACTION_READY:       return "可操作";
+    case PANEL_ACTION_CONFIRMING:  return "确认中";
+    case PANEL_ACTION_SENDING:     return "发送中…";
+    case PANEL_ACTION_DELIVERED:   return "已送达";
+    case PANEL_ACTION_OBSERVED:    return "已处理";
+    case PANEL_ACTION_UNCERTAIN:   return "结果未知";
+    case PANEL_ACTION_STALE:       return "已过期";
+    case PANEL_ACTION_UNSUPPORTED: return "不支持";
+    default:                       return "暂无操作";
     }
 }
 
 static inline const char *panel_action_id_name(panel_action_id_t a)
 {
     switch (a) {
-    case PANEL_ACT_ALLOW_ONCE:   return "Allow once";
-    case PANEL_ACT_ALLOW_ALWAYS: return "Always allow";
-    case PANEL_ACT_DENY:         return "Deny";
-    case PANEL_ACT_CONTINUE:     return "Continue";
+    case PANEL_ACT_ALLOW_ONCE:   return "允许一次";
+    case PANEL_ACT_ALLOW_ALWAYS: return "始终允许";
+    case PANEL_ACT_DENY:         return "拒绝";
+    case PANEL_ACT_CONTINUE:     return "继续";
     default:                     return "";
     }
 }

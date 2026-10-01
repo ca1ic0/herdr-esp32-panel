@@ -369,7 +369,7 @@ static void build_home(void)
 
     s_conn_badge = ui_label(s_home, 120, 28, 140, "", 18, COLOR_UNKNOWN);
 
-    s_pending_count = ui_label(s_home, 260, 24, 140, "Blocked 0", 20, COLOR_PENDING);
+    s_pending_count = ui_label(s_home, 260, 24, 140, "待处理 0", 20, COLOR_PENDING);
     lv_obj_add_flag(s_pending_count, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_pending_count, on_jump_blocked, LV_EVENT_CLICKED, NULL);
 
@@ -416,14 +416,14 @@ static void build_home(void)
     }
 
     /* empty state (0 sessions) */
-    s_empty_label = ui_label(s_home, 40, 200, 400, "No active agents", 24, COLOR_DIM);
+    s_empty_label = ui_label(s_home, 40, 200, 400, "暂无活跃会话", 24, COLOR_DIM);
     lv_obj_set_style_text_align(s_empty_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
 
     /* bottom bar: page indicator + swipe hint (no buttons, gesture nav) */
     s_sound_notice = ui_label(s_home, 16, 411, 448, "", 14, COLOR_PENDING);
-    s_page_label = ui_label(s_home, 16, 436, 120, "Page 1/1", 18, COLOR_DIM);
-    s_total_label = ui_label(s_home, 160, 436, 160, "Total 0", 18, COLOR_DIM);
+    s_page_label = ui_label(s_home, 16, 436, 120, "第 1/1 页", 18, COLOR_DIM);
+    s_total_label = ui_label(s_home, 160, 436, 160, "共 0 个", 18, COLOR_DIM);
     lv_obj_t *hint = ui_label(s_home, 330, 436, 134, LV_SYMBOL_LEFT " swipe " LV_SYMBOL_RIGHT,
                               16, COLOR_DISABLED);
     lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_RIGHT, 0);
@@ -443,7 +443,7 @@ static void fill_cell(int slot, const panel_agent_card_t *a)
         lv_obj_set_style_border_width(c->card, 1, 0);
         lv_obj_set_style_bg_opa(c->card, LV_OPA_30, 0);
         lv_label_set_text(c->name, "");
-        lv_label_set_text(c->status, "Empty");
+        lv_label_set_text(c->status, "空位");
         lv_label_set_text(c->agent, "");
         lv_label_set_text(c->pane, "");
         lv_obj_add_flag(c->icon, LV_OBJ_FLAG_HIDDEN);
@@ -523,15 +523,15 @@ static void refresh_home(const panel_agent_card_t cards[4], int count,
         lv_color_hex(conn == PANEL_CONN_ONLINE ? COLOR_IDLE : COLOR_PENDING), 0);
 
     char buf[48];
-    snprintf(buf, sizeof(buf), "Blocked %d", panel_store_blocked_count());
+    snprintf(buf, sizeof(buf), "待处理 %d", panel_store_blocked_count());
     lv_label_set_text(s_pending_count, buf);
 
     int pages = (count + PAGE_SIZE - 1) / PAGE_SIZE;
     if (pages < 1) pages = 1;
 
-    snprintf(buf, sizeof(buf), "Page %d/%d", s_page + 1, pages);
+    snprintf(buf, sizeof(buf), "第 %d/%d 页", s_page + 1, pages);
     lv_label_set_text(s_page_label, buf);
-    snprintf(buf, sizeof(buf), "Total %d", total);
+    snprintf(buf, sizeof(buf), "共 %d 个", total);
     lv_label_set_text(s_total_label, buf);
     char notice[PANEL_MESSAGE_LEN];
     panel_store_get_sound_notice(notice, sizeof(notice));
@@ -572,7 +572,7 @@ static void build_detail(void)
 
     s_det_name = ui_label(s_detail, 72, 18, 280, "", 24, COLOR_TEXT);
 
-    lv_obj_t *menu = ui_button(s_detail, 408, 8, 56, 48, "Refresh", COLOR_CARD, 18);
+    lv_obj_t *menu = ui_button(s_detail, 408, 8, 56, 48, "刷新", COLOR_CARD, 18);
     lv_obj_add_event_cb(menu, on_refresh, LV_EVENT_CLICKED, NULL);
 
     s_det_status = ui_label(s_detail, 16, 72, 200, "", 24, COLOR_UNKNOWN);
@@ -590,11 +590,11 @@ static void build_detail(void)
     lv_obj_set_style_pad_all(s_det_content, 12, 0);
 
     /* action area: 16,332,448,88 — 2 buttons, or 3 when allow_always exists */
-    s_btn_allow = ui_button(s_detail, 16, 332, 220, 88, "Allow once", COLOR_DONE, 22);
-    s_btn_deny = ui_button(s_detail, 244, 332, 220, 88, "Deny", COLOR_PENDING, 22);
-    s_btn_always = ui_button(s_detail, 324, 332, 140, 88, "Always", COLOR_WORKING, 18);
-    s_btn_continue = ui_button(s_detail, 16, 332, 448, 88, "Continue", COLOR_ACCENT, 22);
-    s_btn_host = ui_button(s_detail, 16, 332, 448, 88, "Use host terminal", COLOR_BORDER, 20);
+    s_btn_allow = ui_button(s_detail, 16, 332, 220, 88, "允许一次", COLOR_DONE, 22);
+    s_btn_deny = ui_button(s_detail, 244, 332, 220, 88, "拒绝", COLOR_PENDING, 22);
+    s_btn_always = ui_button(s_detail, 324, 332, 140, 88, "始终允许", COLOR_WORKING, 18);
+    s_btn_continue = ui_button(s_detail, 16, 332, 448, 88, "继续", COLOR_ACCENT, 22);
+    s_btn_host = ui_button(s_detail, 16, 332, 448, 88, "请在主机处理", COLOR_BORDER, 20);
     lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
@@ -606,7 +606,7 @@ static void build_detail(void)
     lv_obj_add_event_cb(s_btn_continue, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_CONTINUE);
     lv_obj_add_event_cb(s_btn_host, on_refresh, LV_EVENT_CLICKED, NULL);
 
-    s_det_hint = ui_label(s_detail, 16, 432, 448, "Confirm after action", 18, COLOR_DIM);
+    s_det_hint = ui_label(s_detail, 16, 432, 448, "操作前请确认", 18, COLOR_DIM);
 }
 
 static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
@@ -614,19 +614,19 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
 {
     if (det->gone) {
         lv_label_set_text(s_det_name, det->terminal_id);
-        lv_label_set_text(s_det_status, "Ended");
+        lv_label_set_text(s_det_status, "已结束");
         lv_obj_set_style_text_color(s_det_status, lv_color_hex(COLOR_UNKNOWN), 0);
         lv_label_set_text(s_det_project, "");
         lv_label_set_text(s_det_updated, "");
         lv_obj_clean(s_det_content);
-        ui_label(s_det_content, 0, 60, 424, "Session ended — back to list",
+        ui_label(s_det_content, 0, 60, 424, "会话已结束，请返回列表",
                  18, COLOR_DISABLED);
         lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_det_hint, "Session ended");
+        lv_label_set_text(s_det_hint, "会话已结束");
         return;
     }
 
@@ -640,9 +640,9 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
 
     char ubuf[48];
     if (age_s > 6) {
-        snprintf(ubuf, sizeof(ubuf), "Stale %d s", age_s);
+        snprintf(ubuf, sizeof(ubuf), "数据已过期 %d 秒", age_s);
     } else {
-        snprintf(ubuf, sizeof(ubuf), "Updated %d s ago", age_s);
+        snprintf(ubuf, sizeof(ubuf), "更新于 %d 秒前", age_s);
     }
     lv_label_set_text(s_det_updated, ubuf);
     lv_obj_set_style_text_color(s_det_updated,
@@ -708,15 +708,15 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
 
     if (panel_store_action_reserved()) {
         lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Action in progress");
-        lv_label_set_text(s_det_hint, "Wait for current action");
+        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "操作进行中");
+        lv_label_set_text(s_det_hint, "请等待当前操作");
         return;
     }
 
     if (online && age_s > 10) {
         lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Data too old");
-        lv_label_set_text(s_det_hint, "Refreshing; actions disabled");
+        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "数据已过期");
+        lv_label_set_text(s_det_hint, "正在刷新，操作已禁用");
         return;
     }
 
@@ -734,7 +734,7 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
             lv_obj_clear_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(s_det_hint, "Always needs strong confirm");
+            lv_label_set_text(s_det_hint, "始终允许需再次确认");
         } else if (has_allow || has_deny) {
             /* 2-button layout */
             lv_obj_set_pos(s_btn_allow, 16, 332);
@@ -743,30 +743,30 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
             lv_obj_set_size(s_btn_deny, 220, 88);
             if (has_allow) lv_obj_clear_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
             if (has_deny) lv_obj_clear_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(s_det_hint, age_s > 6 ? "Data stale" : "Confirm after action");
+            lv_label_set_text(s_det_hint, age_s > 6 ? "数据已过期" : "操作前请确认");
         } else {
             lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Use host terminal");
-            lv_label_set_text(s_det_hint, "Impact/options incomplete");
+            lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "请在主机处理");
+            lv_label_set_text(s_det_hint, "影响或选项不完整");
         }
     } else if ((det->herdr_status == PANEL_AGENT_IDLE ||
                 det->herdr_status == PANEL_AGENT_DONE) &&
                (choices & PANEL_CHOICE_CONTINUE)) {
         lv_obj_clear_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_det_hint, age_s > 6 ? "Data stale" : "Confirm shows full prompt");
+        lv_label_set_text(s_det_hint, age_s > 6 ? "数据已过期" : "确认页展示完整提示");
     } else if (det->pending.kind == PANEL_PENDING_UNRECOGNIZED ||
                det->herdr_status == PANEL_AGENT_BLOCKED) {
         lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Use host terminal");
-        lv_label_set_text(s_det_hint, "Pending card unrecognized");
+        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "请在主机处理");
+        lv_label_set_text(s_det_hint, "无法识别当前请求");
     } else if (!online) {
         lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Offline, actions disabled");
-        lv_label_set_text(s_det_hint, "Reconnect to act");
+        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "离线，操作已禁用");
+        lv_label_set_text(s_det_hint, "重连后才能操作");
     } else {
         lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "No action available");
-        lv_label_set_text(s_det_hint, "Use host terminal");
+        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "暂无可用操作");
+        lv_label_set_text(s_det_hint, "请在主机处理");
     }
 }
 
@@ -781,7 +781,7 @@ static void build_confirm(void)
     lv_obj_t *back = ui_button(s_confirm, 8, 8, 56, 48, LV_SYMBOL_LEFT, COLOR_CARD, 22);
     lv_obj_add_event_cb(back, on_confirm_cancel, LV_EVENT_CLICKED, NULL);
 
-    s_cnf_title = ui_label(s_confirm, 72, 18, 360, "Confirm", 26, COLOR_TEXT);
+    s_cnf_title = ui_label(s_confirm, 72, 18, 360, "确认", 26, COLOR_TEXT);
 
     ui_label(s_confirm, 16, 80, 448, "", 18, COLOR_DIM); /* spacer */
 
@@ -793,10 +793,10 @@ static void build_confirm(void)
     lv_obj_set_style_text_font(s_cnf_body, ui_font(20), 0);
     lv_obj_set_style_text_color(s_cnf_body, lv_color_hex(COLOR_TEXT), 0);
 
-    s_cnf_hint = ui_label(s_confirm, 16, 348, 448, "Auto-cancel after 10 s", 16, COLOR_DISABLED);
+    s_cnf_hint = ui_label(s_confirm, 16, 348, 448, "10 秒后自动取消", 16, COLOR_DISABLED);
 
-    s_cnf_cancel = ui_button(s_confirm, 16, 372, 448, 48, "Cancel, back to detail", COLOR_CARD, 20);
-    s_cnf_ok = ui_button(s_confirm, 16, 428, 448, 48, "Confirm", COLOR_ACCENT, 22);
+    s_cnf_cancel = ui_button(s_confirm, 16, 372, 448, 48, "取消，返回详情", COLOR_CARD, 20);
+    s_cnf_ok = ui_button(s_confirm, 16, 428, 448, 48, "确认", COLOR_ACCENT, 22);
     lv_obj_add_event_cb(s_cnf_cancel, on_confirm_cancel, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(s_cnf_ok, on_confirm_ok, LV_EVENT_CLICKED, NULL);
 }
@@ -810,32 +810,32 @@ static void show_confirm(panel_action_id_t act, const panel_detail_t *det)
     char body[512];
     if (act == PANEL_ACT_CONTINUE) {
         snprintf(body, sizeof(body),
-                 "%s · %s\n\nPrompt to send:\n%s",
+                 "%s · %s\n\n将发送的提示词：\n%s",
                  det->agent, det->pane_id,
-                 det->pending.prompt[0] ? det->pending.prompt : "(empty)");
-        lv_label_set_text(s_cnf_title, "Confirm continue");
+                 det->pending.prompt[0] ? det->pending.prompt : "（空）");
+        lv_label_set_text(s_cnf_title, "确认继续");
     } else if (act == PANEL_ACT_ALLOW_ALWAYS) {
         snprintf(body, sizeof(body),
-                 "%s · %s\n\nRequest: %s\nImpact: %s\n\nMay change future approvals",
+                 "%s · %s\n\n请求：%s\n影响：%s\n\n可能改变后续审批",
                  det->agent, det->pane_id,
                  det->pending.summary, det->pending.impact);
-        lv_label_set_text(s_cnf_title, "Confirm always allow");
+        lv_label_set_text(s_cnf_title, "确认始终允许");
     } else if (act == PANEL_ACT_DENY) {
         snprintf(body, sizeof(body),
-                 "%s · %s\n\nDeny request: %s\nImpact: %s",
+                 "%s · %s\n\n拒绝请求：%s\n影响：%s",
                  det->agent, det->pane_id,
                  det->pending.summary, det->pending.impact);
-        lv_label_set_text(s_cnf_title, "Confirm deny");
+        lv_label_set_text(s_cnf_title, "确认拒绝");
     } else {
         snprintf(body, sizeof(body),
-                 "%s · %s\n\nRequest: %s\nCwd/impact: %s\nScope: this only",
+                 "%s · %s\n\n请求：%s\n目录/影响：%s\n范围：仅本次",
                  det->agent, det->pane_id,
                  det->pending.summary, det->pending.impact);
-        lv_label_set_text(s_cnf_title, "Confirm allow once");
+        lv_label_set_text(s_cnf_title, "确认允许一次");
     }
     lv_label_set_text(s_cnf_body, body);
     lv_label_set_text(lv_obj_get_child(s_cnf_ok, 0), panel_action_id_name(act));
-    lv_label_set_text(s_cnf_hint, "Auto-cancel after 10 s");
+    lv_label_set_text(s_cnf_hint, "10 秒后自动取消");
     show_screen(SCR_CONFIRM);
 }
 
@@ -884,7 +884,7 @@ static void build_result(void)
     s_rst_body = ui_label(s_result, 16, 160, 448, "", 20, COLOR_DIM);
     lv_obj_set_style_text_align(s_rst_body, LV_TEXT_ALIGN_CENTER, 0);
 
-    s_rst_back = ui_button(s_result, 16, 360, 448, 80, "Back to detail", COLOR_CARD, 22);
+    s_rst_back = ui_button(s_result, 16, 360, 448, 80, "返回详情", COLOR_CARD, 22);
     lv_obj_add_event_cb(s_rst_back, on_result_back, LV_EVENT_CLICKED, NULL);
 }
 
@@ -892,32 +892,32 @@ static void show_result(const panel_action_result_t *r)
 {
     switch (r->state) {
     case PANEL_ACTION_SENDING:
-        lv_label_set_text(s_rst_title, "Sending...");
-        lv_label_set_text(s_rst_body, "Do not retry");
+        lv_label_set_text(s_rst_title, "发送中…");
+        lv_label_set_text(s_rst_body, "请勿重复提交");
         break;
     case PANEL_ACTION_DELIVERED:
-        lv_label_set_text(s_rst_title, "Delivered");
-        lv_label_set_text(s_rst_body, "Waiting for agent");
+        lv_label_set_text(s_rst_title, "已送达");
+        lv_label_set_text(s_rst_body, "等待 Agent 响应");
         break;
     case PANEL_ACTION_OBSERVED:
-        lv_label_set_text(s_rst_title, "Done");
-        lv_label_set_text(s_rst_body, r->message[0] ? r->message : "Context changed (confirmed)");
+        lv_label_set_text(s_rst_title, "已处理");
+        lv_label_set_text(s_rst_body, "已观察到会话状态变化");
         break;
     case PANEL_ACTION_STALE:
-        lv_label_set_text(s_rst_title, "Context changed");
-        lv_label_set_text(s_rst_body, "Prompt changed, review again");
+        lv_label_set_text(s_rst_title, "现场已变化");
+        lv_label_set_text(s_rst_body, "请求已变化，请重新查看");
         break;
     case PANEL_ACTION_UNSUPPORTED:
-        lv_label_set_text(s_rst_title, "Unsupported");
-        lv_label_set_text(s_rst_body, r->message[0] ? r->message : "Use host terminal");
+        lv_label_set_text(s_rst_title, "不支持此操作");
+        lv_label_set_text(s_rst_body, "请在主机处理");
         break;
     case PANEL_ACTION_UNAVAILABLE:
-        lv_label_set_text(s_rst_title, "Auth/protocol error");
-        lv_label_set_text(s_rst_body, r->message[0] ? r->message : "Update credentials");
+        lv_label_set_text(s_rst_title, "鉴权或协议错误");
+        lv_label_set_text(s_rst_body, "请检查网关令牌与接口版本");
         break;
     default:
-        lv_label_set_text(s_rst_title, "Result unknown");
-        lv_label_set_text(s_rst_body, "Check host; no auto-retry");
+        lv_label_set_text(s_rst_title, "结果未知");
+        lv_label_set_text(s_rst_body, "请在主机核实；不会自动重试");
         break;
     }
     show_screen(SCR_RESULT);
@@ -933,7 +933,7 @@ static void build_settings(void)
 
     lv_obj_t *back = ui_button(s_settings, 8, 8, 56, 48, LV_SYMBOL_LEFT, COLOR_CARD, 22);
     lv_obj_add_event_cb(back, on_back, LV_EVENT_CLICKED, NULL);
-    ui_label(s_settings, 80, 20, 300, "Settings", 24, COLOR_TEXT);
+    ui_label(s_settings, 80, 20, 300, "设置", 24, COLOR_TEXT);
 
     lv_obj_t *list = lv_obj_create(s_settings);
     lv_obj_set_pos(list, 8, 72);
@@ -942,9 +942,9 @@ static void build_settings(void)
     lv_obj_set_style_border_width(list, 0, 0);
     lv_obj_set_style_pad_all(list, 0, 0);
     static const struct { const char *name; screen_t target; } items[] = {
-        { "Sound", SCR_SOUND }, { "Display", SCR_DISPLAY },
-        { "Sessions", SCR_SESSIONS }, { "Connection", SCR_CONNECTION },
-        { "About", SCR_ABOUT }, { "Re-provision", SCR_REPROVISION_CONFIRM },
+        { "声音", SCR_SOUND }, { "显示", SCR_DISPLAY },
+        { "会话", SCR_SESSIONS }, { "连接", SCR_CONNECTION },
+        { "关于", SCR_ABOUT }, { "重新配网", SCR_REPROVISION_CONFIRM },
     };
     for (int i = 0; i < 6; i++) {
         lv_obj_t *b = ui_button(list, 8, i * 78, 448, 72, items[i].name,
@@ -952,7 +952,7 @@ static void build_settings(void)
         lv_obj_add_event_cb(b, on_settings_nav, LV_EVENT_CLICKED,
                             (void *)(intptr_t)items[i].target);
     }
-    lv_obj_t *home = ui_button(s_settings, 16, 424, 448, 48, "Back to home", COLOR_CARD, 18);
+    lv_obj_t *home = ui_button(s_settings, 16, 424, 448, 48, "返回首页", COLOR_CARD, 18);
     lv_obj_add_event_cb(home, on_back, LV_EVENT_CLICKED, NULL);
 }
 
@@ -1000,86 +1000,86 @@ static lv_obj_t *add_pref_slider(lv_obj_t *scr, int y,
 
 static void build_pref_pages(void)
 {
-    s_quick = make_pref_page("Quick settings", SCR_HOME);
-    add_pref_button(s_quick, 80, "Sound", PANEL_PREF_SOUND_ENABLED);
-    s_quick_brightness = add_pref_slider(s_quick, 174, "Brightness", PANEL_PREF_BRIGHTNESS, 10, 100);
-    lv_obj_t *all = ui_button(s_quick, 16, 292, 448, 80, "All settings", COLOR_ACCENT, 22);
+    s_quick = make_pref_page("快捷设置", SCR_HOME);
+    add_pref_button(s_quick, 80, "声音", PANEL_PREF_SOUND_ENABLED);
+    s_quick_brightness = add_pref_slider(s_quick, 174, "亮度", PANEL_PREF_BRIGHTNESS, 10, 100);
+    lv_obj_t *all = ui_button(s_quick, 16, 292, 448, 80, "全部设置", COLOR_ACCENT, 22);
     lv_obj_add_event_cb(all, on_settings_nav, LV_EVENT_CLICKED,
                         (void *)(intptr_t)SCR_SETTINGS);
 
-    s_sound = make_pref_page("Sound", SCR_SETTINGS);
+    s_sound = make_pref_page("声音", SCR_SETTINGS);
     s_sound_status = s_pref_status[s_pref_status_count - 1];
-    add_pref_button(s_sound, 76, "Sound", PANEL_PREF_SOUND_ENABLED);
-    s_sound_volume = add_pref_slider(s_sound, 156, "Volume", PANEL_PREF_SOUND_VOLUME, 0, 100);
+    add_pref_button(s_sound, 76, "声音", PANEL_PREF_SOUND_ENABLED);
+    s_sound_volume = add_pref_slider(s_sound, 156, "音量", PANEL_PREF_SOUND_VOLUME, 0, 100);
     lv_obj_t *test_request = ui_button(s_sound, 16, 215, 214, 36,
-                                       "Test request", COLOR_BORDER, 16);
+                                       "试听请求音", COLOR_BORDER, 16);
     lv_obj_t *test_done = ui_button(s_sound, 250, 215, 214, 36,
-                                    "Test done", COLOR_BORDER, 16);
+                                    "试听完成音", COLOR_BORDER, 16);
     lv_obj_add_event_cb(test_request, on_sound_test, LV_EVENT_CLICKED,
                         (void *)(intptr_t)PANEL_AUDIO_REQUEST);
     lv_obj_add_event_cb(test_done, on_sound_test, LV_EVENT_CLICKED,
                         (void *)(intptr_t)PANEL_AUDIO_DONE);
-    add_pref_button(s_sound, 256, "Needs input", PANEL_PREF_SOUND_REQUEST);
-    add_pref_button(s_sound, 330, "Task complete", PANEL_PREF_SOUND_DONE);
-    lv_obj_t *more = ui_button(s_sound, 16, 404, 448, 36, "More sound settings", COLOR_BORDER, 16);
+    add_pref_button(s_sound, 256, "需要输入", PANEL_PREF_SOUND_REQUEST);
+    add_pref_button(s_sound, 330, "任务完成", PANEL_PREF_SOUND_DONE);
+    lv_obj_t *more = ui_button(s_sound, 16, 404, 448, 36, "更多声音设置", COLOR_BORDER, 16);
     lv_obj_add_event_cb(more, on_settings_nav, LV_EVENT_CLICKED,
                         (void *)(intptr_t)SCR_SOUND_MORE);
 
-    s_sound_more = make_pref_page("Sound options", SCR_SOUND);
-    add_pref_button(s_sound_more, 76, "Scope", PANEL_PREF_SOUND_SCOPE);
+    s_sound_more = make_pref_page("声音选项", SCR_SOUND);
+    add_pref_button(s_sound_more, 76, "提醒范围", PANEL_PREF_SOUND_SCOPE);
     add_pref_button(s_sound_more, 150, "Claude", PANEL_PREF_SOUND_CLAUDE);
     add_pref_button(s_sound_more, 224, "OpenCode", PANEL_PREF_SOUND_OPENCODE);
     add_pref_button(s_sound_more, 298, "Pi", PANEL_PREF_SOUND_PI);
-    lv_obj_t *quiet = ui_button(s_sound_more, 16, 372, 448, 68, "Quiet hours", COLOR_CARD, 20);
+    lv_obj_t *quiet = ui_button(s_sound_more, 16, 372, 448, 68, "免打扰", COLOR_CARD, 20);
     lv_obj_add_event_cb(quiet, on_settings_nav, LV_EVENT_CLICKED,
                         (void *)(intptr_t)SCR_QUIET);
 
-    s_quiet = make_pref_page("Quiet hours", SCR_SOUND_MORE);
-    add_pref_button(s_quiet, 76, "Enabled", PANEL_PREF_QUIET_ENABLED);
-    add_pref_button(s_quiet, 150, "Start (+15 min)", PANEL_PREF_QUIET_START);
-    add_pref_button(s_quiet, 224, "End (+15 min)", PANEL_PREF_QUIET_END);
-    add_pref_button(s_quiet, 298, "UTC offset (+15 min)", PANEL_PREF_UTC_OFFSET);
+    s_quiet = make_pref_page("免打扰", SCR_SOUND_MORE);
+    add_pref_button(s_quiet, 76, "已启用", PANEL_PREF_QUIET_ENABLED);
+    add_pref_button(s_quiet, 150, "开始（+15 分）", PANEL_PREF_QUIET_START);
+    add_pref_button(s_quiet, 224, "结束（+15 分）", PANEL_PREF_QUIET_END);
+    add_pref_button(s_quiet, 298, "时区偏移（+15 分）", PANEL_PREF_UTC_OFFSET);
     s_quiet_note = ui_label(s_quiet, 20, 382, 440, "", 16, COLOR_PENDING);
 
-    s_display = make_pref_page("Display", SCR_SETTINGS);
-    s_display_brightness = add_pref_slider(s_display, 72, "Brightness", PANEL_PREF_BRIGHTNESS, 10, 100);
-    add_pref_button(s_display, 166, "Dim after", PANEL_PREF_IDLE_DIM_SECONDS);
-    add_pref_button(s_display, 236, "Dim brightness", PANEL_PREF_DIM_BRIGHTNESS);
-    add_pref_button(s_display, 306, "Reduce motion", PANEL_PREF_REDUCE_MOTION);
-    add_pref_button(s_display, 376, "Visual alert", PANEL_PREF_VISUAL_ALERT);
+    s_display = make_pref_page("显示", SCR_SETTINGS);
+    s_display_brightness = add_pref_slider(s_display, 72, "亮度", PANEL_PREF_BRIGHTNESS, 10, 100);
+    add_pref_button(s_display, 166, "闲置降亮", PANEL_PREF_IDLE_DIM_SECONDS);
+    add_pref_button(s_display, 236, "降亮后亮度", PANEL_PREF_DIM_BRIGHTNESS);
+    add_pref_button(s_display, 306, "减少动画", PANEL_PREF_REDUCE_MOTION);
+    add_pref_button(s_display, 376, "视觉提醒", PANEL_PREF_VISUAL_ALERT);
 
-    s_sessions = make_pref_page("Sessions", SCR_SETTINGS);
-    add_pref_button(s_sessions, 76, "Refresh interval", PANEL_PREF_OVERVIEW_INTERVAL);
-    add_pref_button(s_sessions, 150, "Card order", PANEL_PREF_CARD_ORDER);
-    add_pref_button(s_sessions, 224, "Hide idle", PANEL_PREF_HIDE_IDLE);
-    ui_label(s_sessions, 24, 318, 432, "Continue text: edit on phone", 18, COLOR_DIM);
+    s_sessions = make_pref_page("会话", SCR_SETTINGS);
+    add_pref_button(s_sessions, 76, "刷新间隔", PANEL_PREF_OVERVIEW_INTERVAL);
+    add_pref_button(s_sessions, 150, "卡片排序", PANEL_PREF_CARD_ORDER);
+    add_pref_button(s_sessions, 224, "隐藏空闲", PANEL_PREF_HIDE_IDLE);
+    ui_label(s_sessions, 24, 318, 432, "继续提示词：在主机配置", 18, COLOR_DIM);
 
-    s_connection = make_pref_page("Connection", SCR_SETTINGS);
+    s_connection = make_pref_page("连接", SCR_SETTINGS);
     app_config_t cfg;
     app_config_get(&cfg);
     char label[180];
-    snprintf(label, sizeof(label), "Wi-Fi: %s\nGateway: %s:%u",
+    snprintf(label, sizeof(label), "Wi-Fi：%s\n网关：%s:%u",
              cfg.wifi_ssid, cfg.backend_host, (unsigned)cfg.backend_port);
     lv_obj_t *info = ui_label(s_connection, 20, 100, 440, label, 20, COLOR_TEXT);
     lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
     lv_obj_set_height(info, 160);
-    lv_obj_t *refresh = ui_button(s_connection, 16, 300, 448, 80, "Refresh connection", COLOR_CARD, 20);
+    lv_obj_t *refresh = ui_button(s_connection, 16, 300, 448, 80, "刷新连接", COLOR_CARD, 20);
     lv_obj_add_event_cb(refresh, on_refresh, LV_EVENT_CLICKED, NULL);
 
-    s_about = make_pref_page("About", SCR_SETTINGS);
+    s_about = make_pref_page("关于", SCR_SETTINGS);
     ui_label(s_about, 20, 110, 440, "Herdr Panel\nESP-IDF · Panel API v1", 20, COLOR_TEXT);
 
-    s_reprovision = make_pref_page("Re-provision?", SCR_SETTINGS);
+    s_reprovision = make_pref_page("重新配网？", SCR_SETTINGS);
     lv_obj_t *warn = ui_label(s_reprovision, 20, 110, 440,
-                              "Clear Wi-Fi and gateway token?\nDisplay and sound settings stay saved.",
+                              "清除 Wi-Fi 与网关令牌？\n显示和声音设置会保留。",
                               20, COLOR_TEXT);
     lv_label_set_long_mode(warn, LV_LABEL_LONG_WRAP);
     lv_obj_set_height(warn, 120);
-    lv_obj_t *cancel = ui_button(s_reprovision, 16, 286, 448, 64, "Cancel", COLOR_CARD, 20);
+    lv_obj_t *cancel = ui_button(s_reprovision, 16, 286, 448, 64, "取消", COLOR_CARD, 20);
     lv_obj_add_event_cb(cancel, on_settings_nav, LV_EVENT_CLICKED,
                         (void *)(intptr_t)SCR_SETTINGS);
     lv_obj_t *confirm = ui_button(s_reprovision, 16, 366, 448, 70,
-                                  "Clear credentials", COLOR_PENDING, 20);
+                                  "清除连接凭据", COLOR_PENDING, 20);
     lv_obj_add_event_cb(confirm, on_menu, LV_EVENT_CLICKED, (void *)(intptr_t)3);
 }
 
@@ -1093,16 +1093,16 @@ static void refresh_prefs_ui(void)
         int v = panel_prefs_value(&p, w->field);
         const char *value = NULL;
         if (w->field == PANEL_PREF_SOUND_SCOPE) {
-            value = v == PANEL_SOUND_PAGE ? "Current page" :
-                    v == PANEL_SOUND_SELECTED ? "Selected" : "All";
+            value = v == PANEL_SOUND_PAGE ? "当前页" :
+                    v == PANEL_SOUND_SELECTED ? "已选会话" : "全部";
         } else if (w->field == PANEL_PREF_CARD_ORDER) {
-            value = v == PANEL_ORDER_BLOCKED ? "Blocked first" :
-                    v == PANEL_ORDER_RECENT ? "Recent" : "Fixed";
+            value = v == PANEL_ORDER_BLOCKED ? "待处理优先" :
+                    v == PANEL_ORDER_RECENT ? "最近更新" : "固定顺序";
         } else if (w->field == PANEL_PREF_SOUND_CLAUDE ||
                    w->field == PANEL_PREF_SOUND_OPENCODE ||
                    w->field == PANEL_PREF_SOUND_PI) {
-            value = v == PANEL_SOUND_ON ? "On" :
-                    v == PANEL_SOUND_OFF ? "Off" : "Inherit";
+            value = v == PANEL_SOUND_ON ? "开" :
+                    v == PANEL_SOUND_OFF ? "关" : "继承";
         } else if (w->field == PANEL_PREF_QUIET_START || w->field == PANEL_PREF_QUIET_END) {
             snprintf(buf, sizeof(buf), "%s  %02d:%02d", w->name, v / 60, v % 60);
         } else if (w->field == PANEL_PREF_UTC_OFFSET) {
@@ -1115,7 +1115,7 @@ static void refresh_prefs_ui(void)
         } else if (w->field == PANEL_PREF_DIM_BRIGHTNESS) {
             snprintf(buf, sizeof(buf), "%s  %d%%", w->name, v);
         } else {
-            value = v ? "On" : "Off";
+            value = v ? "开" : "关";
         }
         if (value != NULL) snprintf(buf, sizeof(buf), "%s  %s", w->name, value);
         lv_label_set_text(lv_obj_get_child(w->button, 0), buf);
@@ -1125,10 +1125,10 @@ static void refresh_prefs_ui(void)
     if (s_sound_volume) lv_slider_set_value(s_sound_volume, p.sound_volume, LV_ANIM_OFF);
     if (s_quiet_note) {
         const char *note = p.quiet_enabled && time(NULL) < 1704067200 ?
-            "Clock not synced; sound muted" :
+            "时间未同步，声音已静音" :
             p.quiet_enabled && p.quiet_start == p.quiet_end ?
-            "Start = end: quiet all day" :
-            "Fixed UTC offset; adjust for daylight saving";
+            "起止相同：全天静音" :
+            "固定时区偏移；夏令时请手动调整";
         lv_label_set_text(s_quiet_note, note);
     }
 }
@@ -1140,7 +1140,7 @@ static void refresh_prefs_ui(void)
 static void build_provision(void)
 {
     s_prov = make_screen();
-    ui_label(s_prov, 16, 24, 448, "Join device hotspot", 28, COLOR_TEXT);
+    ui_label(s_prov, 16, 24, 448, "连接设备热点", 28, COLOR_TEXT);
     lv_obj_set_style_text_align(lv_obj_get_child(s_prov, 0), LV_TEXT_ALIGN_CENTER, 0);
 
     /* white quiet zone */
@@ -1185,7 +1185,7 @@ static void show_provision_screen(const char *ssid, const char *pass, const char
 
     char info[192];
     snprintf(info, sizeof(info),
-             "SSID: %s\nPass: %s\nScan to join Wi-Fi\nNo page? 192.168.4.1",
+             "SSID：%s\n密码：%s\n扫码连接 Wi-Fi\n页面未打开？192.168.4.1",
              s_prov_ssid, s_prov_pass);
     lv_label_set_text(s_prov_info, info);
     show_screen(SCR_PROVISION);
@@ -1228,7 +1228,7 @@ static void show_screen(screen_t s)
             lv_screen_load(scr);
         }
         if (s == SCR_SOUND && !panel_audio_ready()) {
-            lv_label_set_text(s_sound_status, "Sound unavailable; check speaker");
+            lv_label_set_text(s_sound_status, "声音不可用，请检查扬声器");
         }
     }
 }
@@ -1261,7 +1261,7 @@ static void on_card(lv_event_t *e)
     lv_label_set_text(s_det_updated, "");
     lv_label_set_text(s_det_hint, "");
     lv_obj_clean(s_det_content);
-    ui_label(s_det_content, 0, 60, 424, "Loading...", 18, COLOR_DISABLED);
+    ui_label(s_det_content, 0, 60, 424, "加载中…", 18, COLOR_DISABLED);
     lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
@@ -1281,7 +1281,7 @@ static void on_menu(lv_event_t *e)
             esp_restart();
         } else {
             for (int i = 0; i < s_pref_status_count; i++) {
-                lv_label_set_text(s_pref_status[i], "Could not clear credentials");
+                lv_label_set_text(s_pref_status[i], "清除连接凭据失败");
             }
         }
         return;
@@ -1328,7 +1328,7 @@ static bool queue_pref(panel_pref_field_t field, int value)
     };
     if (!panel_store_enqueue_control(&cmd)) {
         for (int i = 0; i < s_pref_status_count; i++) {
-            lv_label_set_text(s_pref_status[i], "Busy; setting not saved");
+            lv_label_set_text(s_pref_status[i], "忙碌，设置未保存");
         }
         panel_prefs_t p;
         panel_prefs_get(&p);
@@ -1338,7 +1338,7 @@ static bool queue_pref(panel_pref_field_t field, int value)
         return false;
     }
     for (int i = 0; i < s_pref_status_count; i++) {
-        lv_label_set_text(s_pref_status[i], "Saving...");
+        lv_label_set_text(s_pref_status[i], "保存中…");
     }
     return true;
 }
@@ -1402,13 +1402,13 @@ static void on_sound_test(lv_event_t *e)
     panel_prefs_t prefs;
     panel_prefs_get(&prefs);
     if (!panel_audio_ready()) {
-        lv_label_set_text(s_sound_status, "Sound unavailable; check speaker");
+        lv_label_set_text(s_sound_status, "声音不可用，请检查扬声器");
     } else if (lv_slider_get_value(s_sound_volume) == 0) {
-        lv_label_set_text(s_sound_status, "Raise volume to test sound");
+        lv_label_set_text(s_sound_status, "请先调高音量");
     } else {
         bool queued = panel_audio_play((panel_audio_kind_t)(intptr_t)lv_event_get_user_data(e));
         lv_label_set_text(s_sound_status, queued ?
-                          "Test only; mute setting unchanged" : "Sound busy; try again");
+                          "仅试听；静音设置未改变" : "声音忙碌，请重试");
     }
 }
 
@@ -1472,7 +1472,7 @@ static void on_confirm_ok(lv_event_t *e)
     if (!confirmed_request_current()) {
         s_pending_action = PANEL_ACT_NONE;
         show_screen(SCR_DETAIL);
-        lv_label_set_text(s_det_hint, "Request changed or expired; refresh and review");
+        lv_label_set_text(s_det_hint, "请求已变化或过期，请刷新后重看");
         return;
     }
     if (panel_store_action_reserved()) {
@@ -1482,7 +1482,7 @@ static void on_confirm_ok(lv_event_t *e)
         return;
     }
     if (!panel_store_try_reserve_action()) {
-        lv_label_set_text(s_cnf_hint, "Busy, try later");
+        lv_label_set_text(s_cnf_hint, "忙碌，请稍后重试");
         return;
     }
 
@@ -1499,13 +1499,13 @@ static void on_confirm_ok(lv_event_t *e)
 
     if (!panel_store_enqueue_action(&cmd)) {
         panel_store_release_action();
-        lv_label_set_text(s_cnf_hint, "Busy, try later");
+        lv_label_set_text(s_cnf_hint, "忙碌，请稍后重试");
         return;
     }
 
     s_pending_action = PANEL_ACT_NONE;
     panel_action_result_t sending = { .state = PANEL_ACTION_SENDING };
-    snprintf(sending.message, sizeof(sending.message), "Sending...");
+    snprintf(sending.message, sizeof(sending.message), "发送中…");
     show_result(&sending);
 }
 
@@ -1569,7 +1569,7 @@ void ui_panel_tick(void)
     if (s_screen == SCR_CONFIRM && !confirmed_request_current()) {
         s_pending_action = PANEL_ACT_NONE;
         show_screen(SCR_DETAIL);
-        lv_label_set_text(s_det_hint, "Request changed or expired; refresh and review");
+        lv_label_set_text(s_det_hint, "请求已变化或过期，请刷新后重看");
     }
 
     panel_prefs_t display_prefs;
@@ -1642,9 +1642,9 @@ void ui_panel_tick(void)
         s_last_age_sec = age_s;
         char ubuf[48];
         if (stale_flag) {
-            snprintf(ubuf, sizeof(ubuf), "Stale %d s", age_s);
+            snprintf(ubuf, sizeof(ubuf), "数据已过期 %d 秒", age_s);
         } else {
-            snprintf(ubuf, sizeof(ubuf), "Updated %d s ago", age_s);
+            snprintf(ubuf, sizeof(ubuf), "更新于 %d 秒前", age_s);
         }
         lv_label_set_text(s_det_updated, ubuf);
     }
