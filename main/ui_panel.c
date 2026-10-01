@@ -55,9 +55,10 @@ typedef struct {
     lv_obj_t *card;
     lv_obj_t *shape;      /* status circle */
     lv_obj_t *shape_lbl;  /* ! / ? / check inside shape */
-    lv_obj_t *name;
+    lv_obj_t *name;       /* workspace / project (primary) */
     lv_obj_t *status;
-    lv_obj_t *project;
+    lv_obj_t *icon;       /* 8-bit agent harness icon */
+    lv_obj_t *agent;      /* agent kind, small dim text */
     lv_obj_t *pane;
     char terminal_id[PANEL_TERM_ID_LEN];
 } cell_t;
@@ -125,12 +126,162 @@ static void on_confirm_ok(lv_event_t *e);
 static void on_result_back(lv_event_t *e);
 static void on_refresh(lv_event_t *e);
 static void on_jump_blocked(lv_event_t *e);
+static void on_home_gesture(lv_event_t *e);
+
+/* ---- 8-bit style agent icons (16x16 1bpp pixel maps) -------------------- */
+
+static const char *const ICON_CLAUDE[16] = {   /* spark */
+    "................",
+    ".......XX.......",
+    ".......XX.......",
+    ".......XX.......",
+    "...XX..XX..XX...",
+    "....XX.XX.XX....",
+    ".....XXXXX......",
+    ".XXXXXXXXXXXXX..",
+    ".....XXXXX......",
+    "....XX.XX.XX....",
+    "...XX..XX..XX...",
+    ".......XX.......",
+    ".......XX.......",
+    ".......XX.......",
+    "................",
+    "................",
+};
+
+static const char *const ICON_OPENCODE[16] = {  /* terminal prompt >_ */
+    "................",
+    "................",
+    "..XX............",
+    "...XX...........",
+    "....XX..........",
+    ".....XX.........",
+    "....XX..........",
+    "...XX...........",
+    "..XX............",
+    "................",
+    "................",
+    ".....XXXXXXXXX..",
+    ".....XXXXXXXXX..",
+    "................",
+    "................",
+    "................",
+};
+
+static const char *const ICON_PI[16] = {        /* π */
+    "................",
+    "................",
+    "...XXXXXXXXXX...",
+    "...XXXXXXXXXX...",
+    "....XX....XX....",
+    "....XX....XX....",
+    "....XX....XX....",
+    "....XX....XX....",
+    "....XX....XX....",
+    "....XX....XX....",
+    "....XX....XX....",
+    "...XX.....XX....",
+    "...XX.....XXX...",
+    "..XXX......XX...",
+    "................",
+    "................",
+};
+
+static const char *const ICON_UNKNOWN[16] = {   /* generic chip */
+    "................",
+    "................",
+    "...XXXXXXXXXX...",
+    "..XX.......XX...",
+    "..X.XX...XX.X...",
+    "..X.XX...XX.X...",
+    "..X.........X...",
+    "..X...XXX...X...",
+    "..X...XXX...X...",
+    "..X.........X...",
+    "..XX.......XX...",
+    "...XXXXXXXXXX...",
+    "....XX...XX.....",
+    "....XX...XX.....",
+    "................",
+    "................",
+};
+
+static lv_image_dsc_t s_icon_claude, s_icon_opencode, s_icon_pi, s_icon_unknown;
+static uint8_t s_icon_data[4][16 * 16 * 4];  /* ARGB8888 */
+
+static void build_icon(lv_image_dsc_t *dsc, uint8_t *buf,
+                       const char *const rows[16], uint32_t rgb)
+{
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            bool on = rows[y][x] == 'X';
+            uint8_t *px = buf + (y * 16 + x) * 4;
+            px[0] = (uint8_t)(rgb & 0xFF);          /* B */
+            px[1] = (uint8_t)((rgb >> 8) & 0xFF);   /* G */
+            px[2] = (uint8_t)((rgb >> 16) & 0xFF);  /* R */
+            px[3] = on ? 0xFF : 0x00;               /* A */
+        }
+    }
+    dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+    dsc->header.cf = LV_COLOR_FORMAT_ARGB8888;
+    dsc->header.stride = 16 * 4;
+    dsc->header.w = 16;
+    dsc->header.h = 16;
+    dsc->data = buf;
+    dsc->data_size = 16 * 16 * 4;
+}
+
+static void build_agent_icons(void)
+{
+    build_icon(&s_icon_claude, s_icon_data[0], ICON_CLAUDE, 0xD97757);
+    build_icon(&s_icon_opencode, s_icon_data[1], ICON_OPENCODE, 0x69B5FF);
+    build_icon(&s_icon_pi, s_icon_data[2], ICON_PI, 0x70C995);
+    build_icon(&s_icon_unknown, s_icon_data[3], ICON_UNKNOWN, 0x8D9BAA);
+}
+
+static const lv_image_dsc_t *agent_icon(const char *agent)
+{
+    if (strcmp(agent, "claude") == 0) return &s_icon_claude;
+    if (strcmp(agent, "opencode") == 0) return &s_icon_opencode;
+    if (strcmp(agent, "pi") == 0) return &s_icon_pi;
+    return &s_icon_unknown;
+}
 
 /* ---- helpers ----------------------------------------------------------- */
 
 static void bump_epoch(void)
 {
     s_sel_epoch++;
+}
+
+/* Let LV_EVENT_GESTURE bubble from this object and all descendants, so a
+ * swipe that starts on a card or label still reaches the home screen. */
+static void bubble_gestures(lv_obj_t *obj)
+{
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    uint32_t n = lv_obj_get_child_count(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *child = lv_obj_get_child(obj, (int32_t)i);
+        if (child != NULL) bubble_gestures(child);
+    }
+}
+
+static void page_prev(void)
+{
+    if (s_page > 0) {
+        s_page--;
+        s_seen_generation = 0;  /* force redraw on next tick */
+    }
+}
+
+static void page_next(void)
+{
+    int pages = (s_card_count + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (pages < 1) pages = 1;
+    if (s_page < pages - 1) {
+        s_page++;
+        s_seen_generation = 0;  /* force redraw on next tick */
+    }
 }
 
 static const char *shape_symbol(panel_agent_state_t st)
@@ -219,7 +370,12 @@ static void build_home(void)
 
         c->name = ui_label(c->card, 48, 12, CARD_POS[i].w - 60, "---", 20, COLOR_TEXT);
         c->status = ui_label(c->card, 12, 52, CARD_POS[i].w - 24, "", 24, COLOR_UNKNOWN);
-        c->project = ui_label(c->card, 12, 92, CARD_POS[i].w - 24, "", 18, COLOR_DIM);
+
+        c->icon = lv_image_create(c->card);
+        lv_obj_set_pos(c->icon, 12, 86);
+        lv_image_set_scale(c->icon, 512);   /* 2x nearest: keeps the 8-bit look */
+
+        c->agent = ui_label(c->card, 54, 94, CARD_POS[i].w - 66, "", 14, COLOR_DIM);
         c->pane = ui_label(c->card, 12, CARD_POS[i].h - 28, CARD_POS[i].w - 24, "", 12, COLOR_DISABLED);
     }
 
@@ -228,14 +384,17 @@ static void build_home(void)
     lv_obj_set_style_text_align(s_empty_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* bottom bar */
+    /* bottom bar: page indicator + swipe hint (no buttons, gesture nav) */
     s_page_label = ui_label(s_home, 16, 436, 120, "Page 1/1", 18, COLOR_DIM);
     s_total_label = ui_label(s_home, 160, 436, 160, "Total 0", 18, COLOR_DIM);
+    lv_obj_t *hint = ui_label(s_home, 330, 436, 134, LV_SYMBOL_LEFT " swipe " LV_SYMBOL_RIGHT,
+                              16, COLOR_DISABLED);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_RIGHT, 0);
 
-    lv_obj_t *prev = ui_button(s_home, 340, 428, 52, 40, LV_SYMBOL_LEFT, COLOR_CARD, 18);
-    lv_obj_t *next = ui_button(s_home, 404, 428, 52, 40, LV_SYMBOL_RIGHT, COLOR_CARD, 18);
-    lv_obj_add_event_cb(prev, on_back, LV_EVENT_CLICKED, (void *)(intptr_t)100);
-    lv_obj_add_event_cb(next, on_back, LV_EVENT_CLICKED, (void *)(intptr_t)101);
+    /* touch navigation: swipe left/right to turn pages; let gestures that
+     * start on any child widget bubble up to this screen */
+    lv_obj_add_event_cb(s_home, on_home_gesture, LV_EVENT_GESTURE, NULL);
+    bubble_gestures(s_home);
 }
 
 static void fill_cell(int slot, const panel_agent_card_t *a)
@@ -248,8 +407,9 @@ static void fill_cell(int slot, const panel_agent_card_t *a)
         lv_obj_set_style_bg_opa(c->card, LV_OPA_30, 0);
         lv_label_set_text(c->name, "");
         lv_label_set_text(c->status, "Empty");
-        lv_label_set_text(c->project, "");
+        lv_label_set_text(c->agent, "");
         lv_label_set_text(c->pane, "");
+        lv_obj_add_flag(c->icon, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_bg_color(c->shape, lv_color_hex(COLOR_BORDER), 0);
         lv_label_set_text(c->shape_lbl, "");
         c->terminal_id[0] = '\0';
@@ -273,10 +433,17 @@ static void fill_cell(int slot, const panel_agent_card_t *a)
     }
     lv_label_set_text(c->shape_lbl, shape_symbol(a->herdr_status));
 
-    lv_label_set_text(c->name, a->display_name[0] ? a->display_name : a->agent);
+    /* workspace/project is the primary identity; the agent harness is
+     * shown as its 8-bit icon plus a small kind label */
+    const char *primary = a->workspace_label[0] ? a->workspace_label
+                          : a->cwd_tail[0]      ? a->cwd_tail
+                                                : a->display_name;
+    lv_label_set_text(c->name, primary);
     lv_label_set_text(c->status, panel_agent_state_name(a->herdr_status));
     lv_obj_set_style_text_color(c->status, lv_color_hex(col), 0);
-    lv_label_set_text(c->project, a->cwd_tail[0] ? a->cwd_tail : a->workspace_label);
+    lv_obj_clear_flag(c->icon, LV_OBJ_FLAG_HIDDEN);
+    lv_image_set_src(c->icon, agent_icon(a->agent));
+    lv_label_set_text(c->agent, a->agent);
     lv_label_set_text(c->pane, a->pane_id);
     snprintf(c->terminal_id, sizeof(c->terminal_id), "%s", a->terminal_id);
 }
@@ -845,26 +1012,7 @@ static void on_menu(lv_event_t *e)
 
 static void on_back(lv_event_t *e)
 {
-    void *ud = lv_event_get_user_data(e);
-    intptr_t code = (intptr_t)ud;
-
-    if (code == 100) { /* prev page */
-        if (s_page > 0) {
-            s_page--;
-            s_seen_generation = 0;  /* force redraw on next tick */
-        }
-        return;
-    }
-    if (code == 101) { /* next page */
-        int pages = (s_card_count + PAGE_SIZE - 1) / PAGE_SIZE;
-        if (pages < 1) pages = 1;
-        if (s_page < pages - 1) {
-            s_page++;
-            s_seen_generation = 0;  /* force redraw on next tick */
-        }
-        return;
-    }
-
+    (void)e;
     if (s_screen == SCR_DETAIL) {
         bump_epoch();
         s_sel_term[0] = '\0';
@@ -896,6 +1044,17 @@ static void on_jump_blocked(lv_event_t *e)
         s_page = idx / PAGE_SIZE;
         s_seen_generation = 0;  /* force redraw on next tick */
     }
+}
+
+static void on_home_gesture(lv_event_t *e)
+{
+    (void)e;
+    if (s_screen != SCR_HOME) return;
+    lv_indev_t *indev = lv_indev_active();
+    if (indev == NULL) return;
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if (dir == LV_DIR_LEFT) page_next();
+    else if (dir == LV_DIR_RIGHT) page_prev();
 }
 
 static void on_action_btn(lv_event_t *e)
@@ -977,6 +1136,7 @@ static void on_result_back(lv_event_t *e)
 
 void ui_panel_init(void)
 {
+    build_agent_icons();
     build_home();
     build_detail();
     build_confirm();

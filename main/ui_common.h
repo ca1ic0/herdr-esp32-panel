@@ -26,24 +26,44 @@
 
 /*
  * Font policy (UI_DESIGN.md §2):
- * Chinese body text needs a CJK-capable face at 18/20/24/28.
- * Montserrat has no CJK glyphs — ui_font() falls back to it for digits/
- * Latin only. Before shipping Chinese UI, register a CJK font and point
- * UI_FONT_CJK_* at it. Missing glyphs render as '□'.
- *
- * If LV_FONT_CJK_20 is defined in sdkconfig/lv_conf it is used.
+ * Latin/digits use Montserrat; CJK glyphs resolve through the LVGL 9.5
+ * `fallback` chain to a generated Noto Sans CJK subset (GB2312 level-1,
+ * tools/fonts/make_cjk_fonts.sh). When main/fonts/cjk_fonts.h does not
+ * exist the firmware still builds, but CJK renders as '□'.
  */
+#if defined(__has_include)
+#if __has_include("fonts/cjk_fonts.h")
+#include "fonts/cjk_fonts.h"
+#endif
+#endif
+
 static inline lv_font_t *ui_font(int size)
 {
-#if defined(LV_FONT_CJK_28)
-    if (size >= 28) return (lv_font_t *)&LV_FONT_CJK_28;
-#endif
-#if defined(LV_FONT_CJK_24)
-    if (size >= 24) return (lv_font_t *)&LV_FONT_CJK_24;
-#endif
-#if defined(LV_FONT_CJK_20)
-    if (size >= 20) return (lv_font_t *)&LV_FONT_CJK_20;
-#endif
+#ifdef UI_HAVE_CJK_FONT
+    /* Mutable copies of the built-in Montserrat fonts with the CJK subset
+     * chained as fallback. The built-ins are const, so copy then chain. */
+    static lv_font_t f16, f20, f24;
+    static bool ready;
+    if (!ready) {
+        f16 = lv_font_montserrat_16;
+        f16.fallback = &font_cjk_16;
+        f20 = lv_font_montserrat_20;
+        f20.fallback = &font_cjk_20;
+        f24 = lv_font_montserrat_24;
+        f24.fallback = &font_cjk_24;
+        ready = true;
+    }
+    switch (size) {
+    case 12: return (lv_font_t *)&lv_font_montserrat_12;
+    case 14: return (lv_font_t *)&lv_font_montserrat_14;
+    case 18:
+    case 20: return &f20;
+    case 24:
+    case 26:
+    case 28: return &f24;
+    default: return &f16;
+    }
+#else
     switch (size) {
     case 12: return (lv_font_t *)&lv_font_montserrat_12;
     case 14: return (lv_font_t *)&lv_font_montserrat_14;
@@ -53,6 +73,7 @@ static inline lv_font_t *ui_font(int size)
     case 18: return (lv_font_t *)&lv_font_montserrat_20;  /* nearest available */
     default: return (lv_font_t *)&lv_font_montserrat_16;
     }
+#endif
 }
 
 static inline lv_obj_t *ui_label(lv_obj_t *parent, int x, int y, int w,
