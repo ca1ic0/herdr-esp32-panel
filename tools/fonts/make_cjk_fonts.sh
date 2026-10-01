@@ -23,6 +23,10 @@ for size in 16 20 24; do
     --size "$size" --bpp 4 --format lvgl \
     --lv-font-name "font_cjk_${size}" \
     -o "${OUT}/font_cjk_${size}.c"
+  # The ESP-IDF LVGL component exports lvgl.h directly, not lvgl/lvgl.h.
+  sed 's@#include "lvgl/lvgl.h"@#include "lvgl.h"@' \
+    "${OUT}/font_cjk_${size}.c" > "${OUT}/font_cjk_${size}.tmp"
+  mv "${OUT}/font_cjk_${size}.tmp" "${OUT}/font_cjk_${size}.c"
 done
 
 cat > "${OUT}/cjk_fonts.h" <<'EOF'

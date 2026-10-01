@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -100,6 +101,7 @@ static lv_obj_t *s_rst_title, *s_rst_body, *s_rst_back;
 
 static lv_obj_t *s_quick_brightness, *s_display_brightness, *s_sound_volume;
 static lv_obj_t *s_sound_status;
+static lv_obj_t *s_quiet_note;
 typedef struct {
     lv_obj_t *button;
     panel_pref_field_t field;
@@ -1037,6 +1039,7 @@ static void build_pref_pages(void)
     add_pref_button(s_quiet, 150, "Start (+15 min)", PANEL_PREF_QUIET_START);
     add_pref_button(s_quiet, 224, "End (+15 min)", PANEL_PREF_QUIET_END);
     add_pref_button(s_quiet, 298, "UTC offset (+15 min)", PANEL_PREF_UTC_OFFSET);
+    s_quiet_note = ui_label(s_quiet, 20, 382, 440, "", 16, COLOR_PENDING);
 
     s_display = make_pref_page("Display", SCR_SETTINGS);
     s_display_brightness = add_pref_slider(s_display, 72, "Brightness", PANEL_PREF_BRIGHTNESS, 10, 100);
@@ -1120,6 +1123,14 @@ static void refresh_prefs_ui(void)
     if (s_quick_brightness) lv_slider_set_value(s_quick_brightness, p.brightness, LV_ANIM_OFF);
     if (s_display_brightness) lv_slider_set_value(s_display_brightness, p.brightness, LV_ANIM_OFF);
     if (s_sound_volume) lv_slider_set_value(s_sound_volume, p.sound_volume, LV_ANIM_OFF);
+    if (s_quiet_note) {
+        const char *note = p.quiet_enabled && time(NULL) < 1704067200 ?
+            "Clock not synced; sound muted" :
+            p.quiet_enabled && p.quiet_start == p.quiet_end ?
+            "Start = end: quiet all day" :
+            "Fixed UTC offset; adjust for daylight saving";
+        lv_label_set_text(s_quiet_note, note);
+    }
 }
 
 /* ====================================================================== */

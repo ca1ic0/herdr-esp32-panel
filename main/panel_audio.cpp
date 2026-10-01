@@ -35,22 +35,23 @@ static bool init_codec(void)
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(16, I2S_SLOT_MODE_STEREO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                         I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = BSP_I2S_MCLK,
             .bclk = BSP_I2S_SCLK,
             .ws = BSP_I2S_LCLK,
             .dout = BSP_I2S_DOUT,
             .din = I2S_GPIO_UNUSED,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
         },
     };
     if (i2s_channel_init_std_mode(s_tx, &std_cfg) != ESP_OK) return false;
     if (i2s_channel_enable(s_tx) != ESP_OK) return false;
 
-    audio_codec_i2s_cfg_t data_cfg = {
-        .port = I2S_NUM_0,
-        .tx_handle = s_tx,
-    };
+    audio_codec_i2s_cfg_t data_cfg = {};
+    data_cfg.port = I2S_NUM_0;
+    data_cfg.tx_handle = s_tx;
     const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&data_cfg);
     audio_codec_i2c_cfg_t i2c_cfg = {
         .port = BSP_I2C_NUM,
@@ -61,16 +62,15 @@ static bool init_codec(void)
     const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
     if (data_if == NULL || ctrl_if == NULL || gpio_if == NULL) return false;
 
-    es8311_codec_cfg_t codec_cfg = {
-        .ctrl_if = ctrl_if,
-        .gpio_if = gpio_if,
-        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
-        .pa_pin = GPIO_NUM_NC,
-        .pa_reverted = false,
-        .master_mode = false,
-        .use_mclk = true,
-        .hw_gain = { .pa_voltage = 5.0, .codec_dac_voltage = 3.3 },
-    };
+    es8311_codec_cfg_t codec_cfg = {};
+    codec_cfg.ctrl_if = ctrl_if;
+    codec_cfg.gpio_if = gpio_if;
+    codec_cfg.codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC;
+    codec_cfg.pa_pin = GPIO_NUM_NC;
+    codec_cfg.use_mclk = true;
+    codec_cfg.hw_gain.pa_voltage = 5.0;
+    codec_cfg.hw_gain.codec_dac_voltage = 3.3;
+    codec_cfg.mclk_div = 256;
     const audio_codec_if_t *codec_if = es8311_codec_new(&codec_cfg);
     if (codec_if == NULL) return false;
 

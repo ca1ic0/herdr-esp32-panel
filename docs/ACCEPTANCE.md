@@ -1,6 +1,6 @@
 # 开发顺序与验收清单
 
-本文件供接手实现的 AI/开发者逐项执行。输入规格：[产品逻辑](PRODUCT_LOGIC.md)、[系统架构](ARCHITECTURE.md)、[UI 设计](UI_DESIGN.md)、[运行时设置与声音](SETTINGS_AUDIO.md)。禁止把“编译通过”当成产品完成。`b430005` 后仓库已有 panel API 客户端/状态 store/worker；下面列的是**剩余目标和回归门槛**。
+本文件供接手实现的 AI/开发者逐项执行。输入规格：[产品逻辑](PRODUCT_LOGIC.md)、[系统架构](ARCHITECTURE.md)、[UI 设计](UI_DESIGN.md)、[运行时设置与声音](SETTINGS_AUDIO.md)。禁止把“编译通过”当成产品完成。仓库已有 panel API 客户端、状态 store、worker、运行时设置与声音模块；下面列的是**完整目标和回归门槛**。主机网关位于相邻 `herdr-restful` 仓库。
 
 ## 1. 开工前核对
 
@@ -85,16 +85,13 @@
 
 ## 6. 当前代码与目标的差距
 
-| 当前文件/行为 | 下一步 |
+| 已落地 | 尚需完成或验收 |
 | --- | --- |
-| `main/app_config.c` 只保存连接凭据 | 增加 `panel_prefs_t`、版本/迁移、NVS 保存与失败回滚。 |
-| `main/app_main.cpp` 只在启动时设置背光 | 从 NVS 恢复亮度并支持运行中预览/降亮。 |
-| `main/ui_panel.c` 设置页为静态信息卡 | 实现快捷设置、声音/显示/会话分层页面和保存状态。 |
-| `main/panel_store.h` 的 `SET_DISPLAY_PREF` 在 worker 中未落盘 | 扩为按字段掩码的 `SET_PREF`，避免快速修改互相覆盖。 |
-| `main/panel_api_client.c` 没有事件 API，仓库没有音频模块 | 加 `/events` 游标过滤、固定 Herdr 音效素材和 ES8311/I2S 播放任务。 |
-| `main/provisioning.c` 仅首次配网页 | 设置中提供有时限的临时编辑入口，方便动态改连接与继续提示词。 |
-| `main/ui_common.h` 只有 Montserrat | 加中文字体，实际屏幕可读性验收。 |
-| 本地没有 `refer/` | 后端实施前取到真实网关仓库并核对版本/部署；不能凭文档假定已经有 `/events`。 |
+| `panel_prefs` 按字段保存到 NVS；亮度、音量、排序、轮询、免打扰等可在屏幕运行时修改 | 手机编辑长 `continue_prompt`；滑杆多次松手的 500 ms 合并写入；旧配置 schema 的迁移策略 |
+| 4 宫格、分组设置、确认超时、短页面过渡、降亮与待处理脉冲 | 真机排版/触摸/扫码/显示芯片核对；中文长文本、静态屏与动效的实际可读性 |
+| `panel_audio` 用 ES8311/I2S 播放固定上游音效素材；`/events` 游标由主机网关提供 | 成品扬声器焊接、引脚、功放、声压与故障降级的真机验收；当前事件源仅是状态转移近似，不是 Herdr 原生通知 |
+| 相邻 `herdr-restful` 的事件 API 有网关测试 | 真实 Claude/OpenCode/Pi 版本的审批屏、提示词和动作现场复验；长期掉线恢复压力测试 |
+| 预生成 CJK 字体与 CI ESP-IDF 构建 | 字体许可证文件核对；CI 通过后仍需真机内存与任务栈测量 |
 
 ## 7. 完成定义
 
