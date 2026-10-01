@@ -115,6 +115,8 @@ static panel_http_result_t http_request(esp_http_client_method_t method,
     if (body != NULL) {
         esp_http_client_set_header(s_client, "Content-Type", "application/json");
         esp_http_client_set_post_field(s_client, body, (int)strlen(body));
+    } else {
+        esp_http_client_set_post_field(s_client, NULL, 0);
     }
 
     esp_err_t err = esp_http_client_perform(s_client);
@@ -206,6 +208,7 @@ static panel_http_result_t parse_overview(const char *json, panel_overview_t *ou
 
         cJSON *rev = cJSON_GetObjectItemCaseSensitive(item, "revision");
         c->revision = cJSON_IsNumber(rev) ? (uint32_t)rev->valueint : 0;
+        copy_str(item, "updated_at", c->updated_at, sizeof(c->updated_at));
 
         out->count++;
     }
@@ -343,6 +346,16 @@ static panel_http_result_t parse_action_result(const char *json,
 
     cJSON *root = cJSON_Parse(json);
     if (root != NULL) {
+        /* A partial or unrelated response must never be presented as a
+         * successful action for this request. */
+        cJSON *rid = cJSON_GetObjectItemCaseSensitive(root, "request_id");
+        if (!check_schema(root) || !cJSON_IsString(rid) ||
+            strcmp(rid->valuestring, expect_rid) != 0) {
+            cJSON_Delete(root);
+            out->state = PANEL_ACTION_UNCERTAIN;
+            snprintf(out->message, sizeof(out->message), "Invalid action response");
+            return PANEL_HTTP_OK;
+        }
         copy_str(root, "request_id", out->request_id, sizeof(out->request_id));
         copy_str(root, "message", out->message, sizeof(out->message));
 
@@ -433,31 +446,130 @@ panel_http_result_t panel_api_post_action(const panel_action_cmd_t *cmd,
     }
 
     char body[512];
+    int body_len;
     if (cmd->prompt[0] != '\0') {
-        snprintf(body, sizeof(body),
+        body_len = snprintf(body, sizeof(body),
                  "{\"action\":\"%s\",\"context_token\":\"%s\",\"request_id\":\"%s\",\"prompt\":\"%s\"}",
                  act, cmd->context_token, cmd->request_id, prompt_esc);
     } else {
-        snprintf(body, sizeof(body),
+        body_len = snprintf(body, sizeof(body),
                  "{\"action\":\"%s\",\"context_token\":\"%s\",\"request_id\":\"%s\"}",
                  act, cmd->context_token, cmd->request_id);
     }
+    if (body_len < 0 || body_len >= (int)sizeof(body)) return PANEL_HTTP_PROTO;
 
     static char resp[PANEL_API_ACTION_CAP];
     int status = 0;
     panel_http_result_t r = http_request(HTTP_METHOD_POST, path, body,
                                          resp, sizeof(resp), 5000, &status);
-    if (r == PANEL_HTTP_TOO_LARGE || r == PANEL_HTTP_AUTH) {
+    if (r == PANEL_HTTP_AUTH) {
         memset(result_out, 0, sizeof(*result_out));
         snprintf(result_out->request_id, sizeof(result_out->request_id),
                  "%s", cmd->request_id);
-        result_out->state = (r == PANEL_HTTP_AUTH)
-                                ? PANEL_ACTION_UNAVAILABLE : PANEL_ACTION_UNCERTAIN;
-        snprintf(result_out->message, sizeof(result_out->message),
-                 r == PANEL_HTTP_AUTH ? "Auth failed" : "Result unknown");
+        result_out->state = PANEL_ACTION_UNAVAILABLE;
+        snprintf(result_out->message, sizeof(result_out->message), "Auth failed");
+        return PANEL_HTTP_OK;
+    }
+    if (r != PANEL_HTTP_OK && r != PANEL_HTTP_STALE &&
+        r != PANEL_HTTP_UNSUPPORTED && r != PANEL_HTTP_AUTH) {
+        memset(result_out, 0, sizeof(*result_out));
+        snprintf(result_out->request_id, sizeof(result_out->request_id),
+                 "%s", cmd->request_id);
+        result_out->state = PANEL_ACTION_UNCERTAIN;
+        snprintf(result_out->message, sizeof(result_out->message), "Result unknown");
         return PANEL_HTTP_OK;
     }
 
     /* Even transport errors map to a result state (uncertain), never retry. */
     return parse_action_result(resp, cmd->request_id, status, result_out);
+}
+
+/* ---- notification events -------------------------------------------- */
+
+static bool safe_cursor(const char *s)
+{
+    if (s == NULL) return false;
+    for (; *s; s++) {
+        char c = *s;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')) return false;
+    }
+    return true;
+}
+
+panel_http_result_t panel_api_fetch_events(const char *after,
+                                           panel_event_batch_t *out)
+{
+    if (out == NULL || after == NULL || !safe_cursor(after)) return PANEL_HTTP_PROTO;
+    char path[128];
+    if (after[0] == '\0') {
+        snprintf(path, sizeof(path), "/api/v1/panel/events?limit=16");
+    } else {
+        snprintf(path, sizeof(path), "/api/v1/panel/events?after=%s&limit=16", after);
+    }
+    static char resp[PANEL_API_EVENTS_CAP];
+    int status = 0;
+    panel_http_result_t hr = http_request(HTTP_METHOD_GET, path, NULL,
+                                          resp, sizeof(resp), 2000, &status);
+    if (hr != PANEL_HTTP_OK) return hr;
+    cJSON *root = cJSON_Parse(resp);
+    if (root == NULL || !check_schema(root)) {
+        cJSON_Delete(root);
+        return PANEL_HTTP_PROTO;
+    }
+    memset(out, 0, sizeof(*out));
+    copy_str(root, "server_id", out->server_id, sizeof(out->server_id));
+    copy_str(root, "latest_cursor", out->latest_cursor, sizeof(out->latest_cursor));
+    copy_str(root, "next_cursor", out->next_cursor, sizeof(out->next_cursor));
+    cJSON *gap = cJSON_GetObjectItemCaseSensitive(root, "gap");
+    cJSON *more = cJSON_GetObjectItemCaseSensitive(root, "has_more");
+    cJSON *events = cJSON_GetObjectItemCaseSensitive(root, "events");
+    bool okay = out->server_id[0] && out->next_cursor[0] &&
+                safe_cursor(out->next_cursor) && safe_cursor(out->latest_cursor) &&
+                cJSON_IsBool(gap) && cJSON_IsBool(more) && cJSON_IsArray(events) &&
+                cJSON_GetArraySize(events) <= PANEL_EVENT_MAX;
+    if (!okay) {
+        cJSON_Delete(root);
+        return PANEL_HTTP_PROTO;
+    }
+    out->gap = cJSON_IsTrue(gap);
+    out->has_more = cJSON_IsTrue(more);
+    cJSON *item = NULL;
+    const char *previous_id = after;
+    cJSON_ArrayForEach(item, events) {
+        panel_notice_t *e = &out->events[out->count];
+        copy_str(item, "event_id", e->event_id, sizeof(e->event_id));
+        copy_str(item, "terminal_id", e->terminal_id, sizeof(e->terminal_id));
+        copy_str(item, "agent", e->agent, sizeof(e->agent));
+        cJSON *kind = cJSON_GetObjectItemCaseSensitive(item, "kind");
+        cJSON *age = cJSON_GetObjectItemCaseSensitive(item, "age_ms");
+        if (!e->event_id[0] || !safe_cursor(e->event_id) ||
+            (previous_id[0] && strcmp(e->event_id, previous_id) <= 0) ||
+            !e->terminal_id[0] || !cJSON_IsString(kind) ||
+            !cJSON_IsNumber(age) || age->valuedouble < 0 ||
+            age->valuedouble > 3600000) {
+            cJSON_Delete(root);
+            return PANEL_HTTP_PROTO;
+        }
+        e->kind = strcmp(kind->valuestring, "request") == 0 ? 1 :
+                  strcmp(kind->valuestring, "done") == 0 ? 2 : 0;
+        if (e->kind == 0) {
+            cJSON_Delete(root);
+            return PANEL_HTTP_PROTO;
+        }
+        e->age_ms = (uint32_t)age->valuedouble;
+        previous_id = e->event_id;
+        out->count++;
+    }
+    if ((after[0] == '\0' && out->count != 0) ||
+        (out->gap && (out->count != 0 || out->has_more ||
+                      strcmp(out->next_cursor, out->latest_cursor) != 0)) ||
+        (out->has_more && out->count == 0) ||
+        (out->count > 0 &&
+         strcmp(out->next_cursor, out->events[out->count - 1].event_id) != 0)) {
+        cJSON_Delete(root);
+        return PANEL_HTTP_PROTO;
+    }
+    cJSON_Delete(root);
+    return PANEL_HTTP_OK;
 }

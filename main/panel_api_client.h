@@ -22,6 +22,7 @@ extern "C" {
 #define PANEL_API_OVERVIEW_CAP   (12 * 1024)
 #define PANEL_API_DETAIL_CAP     (6 * 1024)
 #define PANEL_API_ACTION_CAP     (1 * 1024)
+#define PANEL_API_EVENTS_CAP     (4 * 1024)
 
 typedef enum {
     PANEL_HTTP_OK = 0,
@@ -51,6 +52,10 @@ panel_http_result_t panel_api_fetch_detail(const char *terminal_id,
  */
 panel_http_result_t panel_api_post_action(const panel_action_cmd_t *cmd,
                                           panel_action_result_t *result_out);
+
+/** Empty `after` establishes the current event cursor without replay. */
+panel_http_result_t panel_api_fetch_events(const char *after,
+                                           panel_event_batch_t *out);
 
 #ifdef __cplusplus
 }

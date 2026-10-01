@@ -32,6 +32,8 @@ main/
   panel_store.c/h        快照 store + 有界队列（action_q/control_q/ui_evt_q）
   panel_api_client.c/h   唯一 HTTP 客户端，对接 /api/v1/panel
   panel_worker.c/h       请求调度、轮询、动作状态机
+  panel_prefs.c/h        运行时设置、范围校验与 NVS 保存
+  panel_audio.cpp/h      ES8311/I2S 播放任务及有界音效队列
   ui_panel.c/h           LVGL 页面（HOM/DET/CNF/RST/SET/PRV）
   ui_common.h            色板与字体
 components/              板级显示/触摸/电源与 LVGL 适配
@@ -58,9 +60,9 @@ herdr-restful                          # 照常启动 REST 服务
 | GET | `/api/v1/panel/overview` | 最多 24 条 agent 卡 + `total_count` |
 | GET | `/api/v1/panel/agents/{terminal_id}` | 详情 + pending 卡 + `context_token` |
 | POST | `/api/v1/panel/agents/{terminal_id}/actions` | 语义动作，`request_id` 去重 |
-| GET | `/api/v1/panel/events?after=...` | 待新增：Herdr 请求/完成通知事件与游标 |
+| GET | `/api/v1/panel/events?after=...` | 请求/完成状态转移事件与游标；实现位于相邻 `herdr-restful` 仓库 |
 
-鉴权使用设备专属 Bearer 令牌；动作路径需要现场复验、终端锁、at-most-once 去重。`/events` 是 [目标契约](docs/SETTINGS_AUDIO.md)，尚未在本仓库提供实现。
+鉴权使用设备专属 Bearer 令牌；动作路径需要现场复验、终端锁、at-most-once 去重。`/events` 由主机网关实现，面板使用 [事件契约](docs/SETTINGS_AUDIO.md) 拉取；没有 Herdr 原生通知源时，其事件来自状态转移，属于近似通知。
 
 ## 编译
 
@@ -71,6 +73,7 @@ idf.py -p PORT flash monitor
 ```
 
 要求 ESP-IDF ≥ 5.x（维护环境 6.1），LVGL 9.x。
+`.github/workflows/firmware-build.yml` 在推送时用 ESP-IDF 6.1 构建；固件是否发声及触摸/显示兼容性仍须用实际成品验收。
 
 ## 字体
 

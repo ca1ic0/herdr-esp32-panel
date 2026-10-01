@@ -27,6 +27,9 @@
 #include "app_config.h"
 #include "panel_model.h"
 #include "panel_store.h"
+#include "panel_prefs.h"
+#include "panel_display.h"
+#include "panel_audio.h"
 #include "ui_common.h"
 
 #define SCREEN_W     480
@@ -48,6 +51,15 @@ typedef enum {
     SCR_CONFIRM,
     SCR_RESULT,
     SCR_SETTINGS,
+    SCR_QUICK,
+    SCR_SOUND,
+    SCR_SOUND_MORE,
+    SCR_QUIET,
+    SCR_DISPLAY,
+    SCR_SESSIONS,
+    SCR_CONNECTION,
+    SCR_ABOUT,
+    SCR_REPROVISION_CONFIRM,
     SCR_PROVISION,
 } screen_t;
 
@@ -61,13 +73,18 @@ typedef struct {
     lv_obj_t *agent;      /* agent kind, small dim text */
     lv_obj_t *pane;
     char terminal_id[PANEL_TERM_ID_LEN];
+    panel_agent_state_t last_status;
+    int64_t alert_start_ms;
 } cell_t;
 
 /* ---- widget handles --------------------------------------------------- */
 
 static lv_obj_t *s_home, *s_detail, *s_confirm, *s_result, *s_settings, *s_prov;
+static lv_obj_t *s_quick, *s_sound, *s_sound_more, *s_quiet;
+static lv_obj_t *s_display, *s_sessions, *s_connection, *s_about, *s_reprovision;
 
 static lv_obj_t *s_conn_badge, *s_pending_count, *s_page_label, *s_total_label;
+static lv_obj_t *s_sound_notice;
 static lv_obj_t *s_empty_label;
 static cell_t s_cells[4];
 
@@ -81,7 +98,17 @@ static lv_obj_t *s_cnf_cancel, *s_cnf_ok;
 
 static lv_obj_t *s_rst_title, *s_rst_body, *s_rst_back;
 
-static lv_obj_t *s_set_conn, *s_set_display, *s_set_about;
+static lv_obj_t *s_quick_brightness, *s_display_brightness, *s_sound_volume;
+static lv_obj_t *s_sound_status;
+typedef struct {
+    lv_obj_t *button;
+    panel_pref_field_t field;
+    const char *name;
+} pref_widget_t;
+static pref_widget_t s_pref_widgets[32];
+static int s_pref_widget_count;
+static lv_obj_t *s_pref_status[9];
+static int s_pref_status_count;
 
 static lv_obj_t *s_prov_qr, *s_prov_info;
 
@@ -96,10 +123,10 @@ static char s_sel_term[PANEL_TERM_ID_LEN];
 static uint32_t s_sel_epoch;
 static panel_action_id_t s_pending_action;
 static panel_pending_t s_frozen_pending;
+static int64_t s_confirm_started_ms;
+static bool s_dimmed;
 
-/* display prefs (UI-local) */
-static int s_brightness = 45;
-static bool s_reduce_motion;
+static uint32_t s_edit_id;
 
 /* provisioning copy */
 static char s_prov_ssid[24];
@@ -127,6 +154,11 @@ static void on_result_back(lv_event_t *e);
 static void on_refresh(lv_event_t *e);
 static void on_jump_blocked(lv_event_t *e);
 static void on_home_gesture(lv_event_t *e);
+static void refresh_prefs_ui(void);
+static void on_pref_click(lv_event_t *e);
+static void on_pref_slider(lv_event_t *e);
+static void on_settings_nav(lv_event_t *e);
+static void on_sound_test(lv_event_t *e);
 
 /* ---- 8-bit style agent icons (16x16 1bpp pixel maps) -------------------- */
 
@@ -270,6 +302,7 @@ static void page_prev(void)
 {
     if (s_page > 0) {
         s_page--;
+        panel_store_set_view_context(s_page, s_sel_term);
         s_seen_generation = 0;  /* force redraw on next tick */
     }
 }
@@ -280,6 +313,7 @@ static void page_next(void)
     if (pages < 1) pages = 1;
     if (s_page < pages - 1) {
         s_page++;
+        panel_store_set_view_context(s_page, s_sel_term);
         s_seen_generation = 0;  /* force redraw on next tick */
     }
 }
@@ -385,6 +419,7 @@ static void build_home(void)
     lv_obj_add_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
 
     /* bottom bar: page indicator + swipe hint (no buttons, gesture nav) */
+    s_sound_notice = ui_label(s_home, 16, 411, 448, "", 14, COLOR_PENDING);
     s_page_label = ui_label(s_home, 16, 436, 120, "Page 1/1", 18, COLOR_DIM);
     s_total_label = ui_label(s_home, 160, 436, 160, "Total 0", 18, COLOR_DIM);
     lv_obj_t *hint = ui_label(s_home, 330, 436, 134, LV_SYMBOL_LEFT " swipe " LV_SYMBOL_RIGHT,
@@ -413,11 +448,21 @@ static void fill_cell(int slot, const panel_agent_card_t *a)
         lv_obj_set_style_bg_color(c->shape, lv_color_hex(COLOR_BORDER), 0);
         lv_label_set_text(c->shape_lbl, "");
         c->terminal_id[0] = '\0';
+        c->last_status = PANEL_AGENT_UNKNOWN;
+        c->alert_start_ms = 0;
         return;
     }
 
     lv_obj_set_style_bg_opa(c->card, LV_OPA_COVER, 0);
     bool blocked = (a->herdr_status == PANEL_AGENT_BLOCKED);
+    if (strcmp(c->terminal_id, a->terminal_id) != 0) c->alert_start_ms = 0;
+    if (strcmp(c->terminal_id, a->terminal_id) == 0 &&
+        c->last_status != PANEL_AGENT_UNKNOWN &&
+        c->last_status != PANEL_AGENT_BLOCKED && blocked) {
+        panel_prefs_t p;
+        panel_prefs_get(&p);
+        if (p.visual_alert && !p.reduce_motion) c->alert_start_ms = ui_now_ms();
+    }
     style_card_base(c->card, blocked, false);
 
     uint32_t col = panel_agent_state_color(a->herdr_status);
@@ -446,6 +491,26 @@ static void fill_cell(int slot, const panel_agent_card_t *a)
     lv_label_set_text(c->agent, a->agent);
     lv_label_set_text(c->pane, a->pane_id);
     snprintf(c->terminal_id, sizeof(c->terminal_id), "%s", a->terminal_id);
+    c->last_status = a->herdr_status;
+}
+
+static void update_alert_pulses(void)
+{
+    panel_prefs_t p;
+    panel_prefs_get(&p);
+    for (int i = 0; i < 4; i++) {
+        cell_t *c = &s_cells[i];
+        if (c->alert_start_ms == 0) continue;
+        int64_t age = ui_now_ms() - c->alert_start_ms;
+        if (age >= 800 || c->last_status != PANEL_AGENT_BLOCKED ||
+            p.reduce_motion || !p.visual_alert) {
+            c->alert_start_ms = 0;
+            lv_obj_set_style_border_width(c->card, 2, 0);
+        } else {
+            bool peak = (age < 200) || (age >= 400 && age < 600);
+            lv_obj_set_style_border_width(c->card, peak ? 5 : 2, 0);
+        }
+    }
 }
 
 static void refresh_home(const panel_agent_card_t cards[4], int count,
@@ -466,11 +531,17 @@ static void refresh_home(const panel_agent_card_t cards[4], int count,
     lv_label_set_text(s_page_label, buf);
     snprintf(buf, sizeof(buf), "Total %d", total);
     lv_label_set_text(s_total_label, buf);
+    char notice[PANEL_MESSAGE_LEN];
+    panel_store_get_sound_notice(notice, sizeof(notice));
+    lv_label_set_text(s_sound_notice, notice);
 
     if (count == 0) {
         lv_obj_clear_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
         for (int i = 0; i < 4; i++) {
             lv_obj_add_flag(s_cells[i].card, LV_OBJ_FLAG_HIDDEN);
+            s_cells[i].terminal_id[0] = '\0';
+            s_cells[i].last_status = PANEL_AGENT_UNKNOWN;
+            s_cells[i].alert_start_ms = 0;
         }
         return;
     }
@@ -732,6 +803,7 @@ static void show_confirm(panel_action_id_t act, const panel_detail_t *det)
 {
     s_pending_action = act;
     s_frozen_pending = det->pending;
+    s_confirm_started_ms = ui_now_ms();
 
     char body[512];
     if (act == PANEL_ACT_CONTINUE) {
@@ -760,8 +832,41 @@ static void show_confirm(panel_action_id_t act, const panel_detail_t *det)
         lv_label_set_text(s_cnf_title, "Confirm allow once");
     }
     lv_label_set_text(s_cnf_body, body);
-    lv_label_set_text(s_cnf_ok, panel_action_id_name(act));
+    lv_label_set_text(lv_obj_get_child(s_cnf_ok, 0), panel_action_id_name(act));
+    lv_label_set_text(s_cnf_hint, "Auto-cancel after 10 s");
     show_screen(SCR_CONFIRM);
+}
+
+static uint8_t action_choice(panel_action_id_t action)
+{
+    switch (action) {
+    case PANEL_ACT_ALLOW_ONCE: return PANEL_CHOICE_ALLOW_ONCE;
+    case PANEL_ACT_ALLOW_ALWAYS: return PANEL_CHOICE_ALLOW_ALWAYS;
+    case PANEL_ACT_DENY: return PANEL_CHOICE_DENY;
+    case PANEL_ACT_CONTINUE: return PANEL_CHOICE_CONTINUE;
+    default: return 0;
+    }
+}
+
+/* Revalidate the exact visible request immediately before enqueue. */
+static bool confirmed_request_current(void)
+{
+    if (s_pending_action == PANEL_ACT_NONE ||
+        ui_now_ms() - s_confirm_started_ms >= 10000 ||
+        panel_store_conn_state() != PANEL_CONN_ONLINE) return false;
+    panel_detail_t det;
+    if (!panel_store_get_detail(&det) || det.gone || !det.valid ||
+        det.selection_epoch != s_sel_epoch ||
+        strcmp(det.terminal_id, s_sel_term) != 0 ||
+        det.fetched_at_ms <= 0 ||
+        ui_now_ms() - det.fetched_at_ms > 10000 ||
+        det.pending.kind != s_frozen_pending.kind ||
+        !(det.pending.choices & action_choice(s_pending_action)) ||
+        strcmp(det.pending.context_token, s_frozen_pending.context_token) != 0)
+        return false;
+    if (s_pending_action == PANEL_ACT_CONTINUE &&
+        strcmp(det.pending.prompt, s_frozen_pending.prompt) != 0) return false;
+    return true;
 }
 
 /* ====================================================================== */
@@ -825,60 +930,196 @@ static void build_settings(void)
     s_settings = make_screen();
 
     lv_obj_t *back = ui_button(s_settings, 8, 8, 56, 48, LV_SYMBOL_LEFT, COLOR_CARD, 22);
-    lv_obj_add_event_cb(back, on_back, LV_EVENT_CLICKED, (void *)(intptr_t)11);
-    ui_label(s_settings, 72, 22, 300, "Settings", 24, COLOR_TEXT);
+    lv_obj_add_event_cb(back, on_back, LV_EVENT_CLICKED, NULL);
+    ui_label(s_settings, 80, 20, 300, "Settings", 24, COLOR_TEXT);
 
-    /* 4 rows ≥84 px — view only, no virtual keyboard */
-    s_set_conn = lv_obj_create(s_settings);
-    lv_obj_set_pos(s_set_conn, 16, 80);
-    lv_obj_set_size(s_set_conn, 448, 100);
-    lv_obj_set_style_bg_color(s_set_conn, lv_color_hex(COLOR_CARD), 0);
-    lv_obj_set_style_bg_opa(s_set_conn, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_set_conn, 12, 0);
-    ui_label(s_set_conn, 12, 12, 400, "Connection", 20, COLOR_TEXT);
-    ui_label(s_set_conn, 12, 44, 400, "", 16, COLOR_DIM);
-
-    s_set_display = lv_obj_create(s_settings);
-    lv_obj_set_pos(s_set_display, 16, 196);
-    lv_obj_set_size(s_set_display, 448, 100);
-    lv_obj_set_style_bg_color(s_set_display, lv_color_hex(COLOR_CARD), 0);
-    lv_obj_set_style_bg_opa(s_set_display, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_set_display, 12, 0);
-    ui_label(s_set_display, 12, 12, 400, "Display", 20, COLOR_TEXT);
-    ui_label(s_set_display, 12, 44, 400, "", 16, COLOR_DIM);
-
-    s_set_about = lv_obj_create(s_settings);
-    lv_obj_set_pos(s_set_about, 16, 312);
-    lv_obj_set_size(s_set_about, 448, 100);
-    lv_obj_set_style_bg_color(s_set_about, lv_color_hex(COLOR_CARD), 0);
-    lv_obj_set_style_bg_opa(s_set_about, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(s_set_about, 12, 0);
-    ui_label(s_set_about, 12, 12, 400, "About", 20, COLOR_TEXT);
-    ui_label(s_set_about, 12, 44, 400, "", 16, COLOR_DIM);
-
-    /* re-provision entry */
-    lv_obj_t *re = ui_button(s_settings, 16, 428, 448, 44, "Re-provision", COLOR_PENDING, 20);
-    lv_obj_add_event_cb(re, on_menu, LV_EVENT_CLICKED, (void *)(intptr_t)3);
+    lv_obj_t *list = lv_obj_create(s_settings);
+    lv_obj_set_pos(list, 8, 72);
+    lv_obj_set_size(list, 464, 338);
+    lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 0, 0);
+    static const struct { const char *name; screen_t target; } items[] = {
+        { "Sound", SCR_SOUND }, { "Display", SCR_DISPLAY },
+        { "Sessions", SCR_SESSIONS }, { "Connection", SCR_CONNECTION },
+        { "About", SCR_ABOUT }, { "Re-provision", SCR_REPROVISION_CONFIRM },
+    };
+    for (int i = 0; i < 6; i++) {
+        lv_obj_t *b = ui_button(list, 8, i * 78, 448, 72, items[i].name,
+                                i == 5 ? COLOR_PENDING : COLOR_CARD, 22);
+        lv_obj_add_event_cb(b, on_settings_nav, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)items[i].target);
+    }
+    lv_obj_t *home = ui_button(s_settings, 16, 424, 448, 48, "Back to home", COLOR_CARD, 18);
+    lv_obj_add_event_cb(home, on_back, LV_EVENT_CLICKED, NULL);
 }
 
-static void refresh_settings(int session_count, panel_conn_state_t conn)
+static lv_obj_t *make_pref_page(const char *title, screen_t parent)
 {
+    lv_obj_t *scr = make_screen();
+    lv_obj_t *back = ui_button(scr, 8, 8, 56, 48, LV_SYMBOL_LEFT, COLOR_CARD, 22);
+    lv_obj_add_event_cb(back, on_settings_nav, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)parent);
+    ui_label(scr, 80, 20, 370, title, 24, COLOR_TEXT);
+    if (s_pref_status_count < (int)(sizeof(s_pref_status) / sizeof(s_pref_status[0]))) {
+        s_pref_status[s_pref_status_count++] =
+            ui_label(scr, 16, 444, 448, "", 16, COLOR_DIM);
+    }
+    return scr;
+}
+
+static lv_obj_t *add_pref_button(lv_obj_t *scr, int y,
+                                  const char *name, panel_pref_field_t field)
+{
+    lv_obj_t *b = ui_button(scr, 16, y, 448, 68, name, COLOR_CARD, 20);
+    lv_obj_add_event_cb(b, on_pref_click, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)(field + 1));
+    if (s_pref_widget_count < (int)(sizeof(s_pref_widgets) / sizeof(s_pref_widgets[0]))) {
+        s_pref_widgets[s_pref_widget_count++] = (pref_widget_t){ b, field, name };
+    }
+    return b;
+}
+
+static lv_obj_t *add_pref_slider(lv_obj_t *scr, int y,
+                                  const char *name, panel_pref_field_t field,
+                                  int min_value, int max_value)
+{
+    ui_label(scr, 16, y, 448, name, 18, COLOR_DIM);
+    lv_obj_t *slider = lv_slider_create(scr);
+    lv_obj_set_pos(slider, 40, y + 38);
+    lv_obj_set_size(slider, 400, 20);
+    lv_slider_set_range(slider, min_value, max_value);
+    lv_obj_add_event_cb(slider, on_pref_slider, LV_EVENT_VALUE_CHANGED,
+                        (void *)(intptr_t)(field + 1));
+    lv_obj_add_event_cb(slider, on_pref_slider, LV_EVENT_RELEASED,
+                        (void *)(intptr_t)(field + 1));
+    return slider;
+}
+
+static void build_pref_pages(void)
+{
+    s_quick = make_pref_page("Quick settings", SCR_HOME);
+    add_pref_button(s_quick, 80, "Sound", PANEL_PREF_SOUND_ENABLED);
+    s_quick_brightness = add_pref_slider(s_quick, 174, "Brightness", PANEL_PREF_BRIGHTNESS, 10, 100);
+    lv_obj_t *all = ui_button(s_quick, 16, 292, 448, 80, "All settings", COLOR_ACCENT, 22);
+    lv_obj_add_event_cb(all, on_settings_nav, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)SCR_SETTINGS);
+
+    s_sound = make_pref_page("Sound", SCR_SETTINGS);
+    s_sound_status = s_pref_status[s_pref_status_count - 1];
+    add_pref_button(s_sound, 76, "Sound", PANEL_PREF_SOUND_ENABLED);
+    s_sound_volume = add_pref_slider(s_sound, 156, "Volume", PANEL_PREF_SOUND_VOLUME, 0, 100);
+    lv_obj_t *test_request = ui_button(s_sound, 16, 215, 214, 36,
+                                       "Test request", COLOR_BORDER, 16);
+    lv_obj_t *test_done = ui_button(s_sound, 250, 215, 214, 36,
+                                    "Test done", COLOR_BORDER, 16);
+    lv_obj_add_event_cb(test_request, on_sound_test, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)PANEL_AUDIO_REQUEST);
+    lv_obj_add_event_cb(test_done, on_sound_test, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)PANEL_AUDIO_DONE);
+    add_pref_button(s_sound, 256, "Needs input", PANEL_PREF_SOUND_REQUEST);
+    add_pref_button(s_sound, 330, "Task complete", PANEL_PREF_SOUND_DONE);
+    lv_obj_t *more = ui_button(s_sound, 16, 404, 448, 36, "More sound settings", COLOR_BORDER, 16);
+    lv_obj_add_event_cb(more, on_settings_nav, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)SCR_SOUND_MORE);
+
+    s_sound_more = make_pref_page("Sound options", SCR_SOUND);
+    add_pref_button(s_sound_more, 76, "Scope", PANEL_PREF_SOUND_SCOPE);
+    add_pref_button(s_sound_more, 150, "Claude", PANEL_PREF_SOUND_CLAUDE);
+    add_pref_button(s_sound_more, 224, "OpenCode", PANEL_PREF_SOUND_OPENCODE);
+    add_pref_button(s_sound_more, 298, "Pi", PANEL_PREF_SOUND_PI);
+    lv_obj_t *quiet = ui_button(s_sound_more, 16, 372, 448, 68, "Quiet hours", COLOR_CARD, 20);
+    lv_obj_add_event_cb(quiet, on_settings_nav, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)SCR_QUIET);
+
+    s_quiet = make_pref_page("Quiet hours", SCR_SOUND_MORE);
+    add_pref_button(s_quiet, 76, "Enabled", PANEL_PREF_QUIET_ENABLED);
+    add_pref_button(s_quiet, 150, "Start (+15 min)", PANEL_PREF_QUIET_START);
+    add_pref_button(s_quiet, 224, "End (+15 min)", PANEL_PREF_QUIET_END);
+    add_pref_button(s_quiet, 298, "UTC offset (+15 min)", PANEL_PREF_UTC_OFFSET);
+
+    s_display = make_pref_page("Display", SCR_SETTINGS);
+    s_display_brightness = add_pref_slider(s_display, 72, "Brightness", PANEL_PREF_BRIGHTNESS, 10, 100);
+    add_pref_button(s_display, 166, "Dim after", PANEL_PREF_IDLE_DIM_SECONDS);
+    add_pref_button(s_display, 236, "Dim brightness", PANEL_PREF_DIM_BRIGHTNESS);
+    add_pref_button(s_display, 306, "Reduce motion", PANEL_PREF_REDUCE_MOTION);
+    add_pref_button(s_display, 376, "Visual alert", PANEL_PREF_VISUAL_ALERT);
+
+    s_sessions = make_pref_page("Sessions", SCR_SETTINGS);
+    add_pref_button(s_sessions, 76, "Refresh interval", PANEL_PREF_OVERVIEW_INTERVAL);
+    add_pref_button(s_sessions, 150, "Card order", PANEL_PREF_CARD_ORDER);
+    add_pref_button(s_sessions, 224, "Hide idle", PANEL_PREF_HIDE_IDLE);
+    ui_label(s_sessions, 24, 318, 432, "Continue text: edit on phone", 18, COLOR_DIM);
+
+    s_connection = make_pref_page("Connection", SCR_SETTINGS);
     app_config_t cfg;
     app_config_get(&cfg);
+    char label[180];
+    snprintf(label, sizeof(label), "Wi-Fi: %s\nGateway: %s:%u",
+             cfg.wifi_ssid, cfg.backend_host, (unsigned)cfg.backend_port);
+    lv_obj_t *info = ui_label(s_connection, 20, 100, 440, label, 20, COLOR_TEXT);
+    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
+    lv_obj_set_height(info, 160);
+    lv_obj_t *refresh = ui_button(s_connection, 16, 300, 448, 80, "Refresh connection", COLOR_CARD, 20);
+    lv_obj_add_event_cb(refresh, on_refresh, LV_EVENT_CLICKED, NULL);
 
-    char buf[200];
-    /* Never render password/token. */
-    snprintf(buf, sizeof(buf), "Wi-Fi: %s\nServer: %s:%u · %s",
-             cfg.wifi_ssid, cfg.backend_host, (unsigned)cfg.backend_port,
-             panel_conn_state_name(conn));
-    lv_label_set_text(lv_obj_get_child(s_set_conn, 1), buf);
+    s_about = make_pref_page("About", SCR_SETTINGS);
+    ui_label(s_about, 20, 110, 440, "Herdr Panel\nESP-IDF · Panel API v1", 20, COLOR_TEXT);
 
-    snprintf(buf, sizeof(buf), "Bright %d%% · Reduce motion %s",
-             s_brightness, s_reduce_motion ? "On" : "Off");
-    lv_label_set_text(lv_obj_get_child(s_set_display, 1), buf);
+    s_reprovision = make_pref_page("Re-provision?", SCR_SETTINGS);
+    lv_obj_t *warn = ui_label(s_reprovision, 20, 110, 440,
+                              "Clear Wi-Fi and gateway token?\nDisplay and sound settings stay saved.",
+                              20, COLOR_TEXT);
+    lv_label_set_long_mode(warn, LV_LABEL_LONG_WRAP);
+    lv_obj_set_height(warn, 120);
+    lv_obj_t *cancel = ui_button(s_reprovision, 16, 286, 448, 64, "Cancel", COLOR_CARD, 20);
+    lv_obj_add_event_cb(cancel, on_settings_nav, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)SCR_SETTINGS);
+    lv_obj_t *confirm = ui_button(s_reprovision, 16, 366, 448, 70,
+                                  "Clear credentials", COLOR_PENDING, 20);
+    lv_obj_add_event_cb(confirm, on_menu, LV_EVENT_CLICKED, (void *)(intptr_t)3);
+}
 
-    snprintf(buf, sizeof(buf), "FW v0.2 · Proto v1 · Sessions %d", session_count);
-    lv_label_set_text(lv_obj_get_child(s_set_about, 1), buf);
+static void refresh_prefs_ui(void)
+{
+    panel_prefs_t p;
+    panel_prefs_get(&p);
+    char buf[100];
+    for (int i = 0; i < s_pref_widget_count; i++) {
+        pref_widget_t *w = &s_pref_widgets[i];
+        int v = panel_prefs_value(&p, w->field);
+        const char *value = NULL;
+        if (w->field == PANEL_PREF_SOUND_SCOPE) {
+            value = v == PANEL_SOUND_PAGE ? "Current page" :
+                    v == PANEL_SOUND_SELECTED ? "Selected" : "All";
+        } else if (w->field == PANEL_PREF_CARD_ORDER) {
+            value = v == PANEL_ORDER_BLOCKED ? "Blocked first" :
+                    v == PANEL_ORDER_RECENT ? "Recent" : "Fixed";
+        } else if (w->field == PANEL_PREF_SOUND_CLAUDE ||
+                   w->field == PANEL_PREF_SOUND_OPENCODE ||
+                   w->field == PANEL_PREF_SOUND_PI) {
+            value = v == PANEL_SOUND_ON ? "On" :
+                    v == PANEL_SOUND_OFF ? "Off" : "Inherit";
+        } else if (w->field == PANEL_PREF_QUIET_START || w->field == PANEL_PREF_QUIET_END) {
+            snprintf(buf, sizeof(buf), "%s  %02d:%02d", w->name, v / 60, v % 60);
+        } else if (w->field == PANEL_PREF_UTC_OFFSET) {
+            int absv = v < 0 ? -v : v;
+            snprintf(buf, sizeof(buf), "%s  %c%02d:%02d", w->name,
+                     v < 0 ? '-' : '+', absv / 60, absv % 60);
+        } else if (w->field == PANEL_PREF_OVERVIEW_INTERVAL ||
+                   w->field == PANEL_PREF_IDLE_DIM_SECONDS) {
+            snprintf(buf, sizeof(buf), "%s  %d s", w->name, v);
+        } else if (w->field == PANEL_PREF_DIM_BRIGHTNESS) {
+            snprintf(buf, sizeof(buf), "%s  %d%%", w->name, v);
+        } else {
+            value = v ? "On" : "Off";
+        }
+        if (value != NULL) snprintf(buf, sizeof(buf), "%s  %s", w->name, value);
+        lv_label_set_text(lv_obj_get_child(w->button, 0), buf);
+    }
+    if (s_quick_brightness) lv_slider_set_value(s_quick_brightness, p.brightness, LV_ANIM_OFF);
+    if (s_display_brightness) lv_slider_set_value(s_display_brightness, p.brightness, LV_ANIM_OFF);
+    if (s_sound_volume) lv_slider_set_value(s_sound_volume, p.sound_volume, LV_ANIM_OFF);
 }
 
 /* ====================================================================== */
@@ -945,6 +1186,8 @@ static void show_provision_screen(const char *ssid, const char *pass, const char
 
 static void show_screen(screen_t s)
 {
+    if (s == SCR_HOME && s_screen != SCR_HOME) s_seen_generation = 0;
+    screen_t previous = s_screen;
     s_screen = s;
     lv_obj_t *scr = NULL;
     switch (s) {
@@ -953,9 +1196,30 @@ static void show_screen(screen_t s)
     case SCR_CONFIRM: scr = s_confirm; break;
     case SCR_RESULT: scr = s_result; break;
     case SCR_SETTINGS: scr = s_settings; break;
+    case SCR_QUICK: scr = s_quick; break;
+    case SCR_SOUND: scr = s_sound; break;
+    case SCR_SOUND_MORE: scr = s_sound_more; break;
+    case SCR_QUIET: scr = s_quiet; break;
+    case SCR_DISPLAY: scr = s_display; break;
+    case SCR_SESSIONS: scr = s_sessions; break;
+    case SCR_CONNECTION: scr = s_connection; break;
+    case SCR_ABOUT: scr = s_about; break;
+    case SCR_REPROVISION_CONFIRM: scr = s_reprovision; break;
     case SCR_PROVISION: scr = s_prov; break;
     }
-    if (scr != NULL) lv_screen_load(scr);
+    if (scr != NULL) {
+        panel_prefs_t p;
+        panel_prefs_get(&p);
+        if (previous != s && !p.reduce_motion &&
+            s != SCR_CONFIRM && s != SCR_PROVISION) {
+            lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_FADE_IN, 120, 0, false);
+        } else {
+            lv_screen_load(scr);
+        }
+        if (s == SCR_SOUND && !panel_audio_ready()) {
+            lv_label_set_text(s_sound_status, "Sound unavailable; check speaker");
+        }
+    }
 }
 
 static void on_card(lv_event_t *e)
@@ -967,6 +1231,7 @@ static void on_card(lv_event_t *e)
 
     bump_epoch();
     snprintf(s_sel_term, sizeof(s_sel_term), "%s", term);
+    panel_store_set_view_context(s_page, s_sel_term);
 
     panel_cmd_t cmd = {
         .type = PANEL_CMD_OPEN_DETAIL,
@@ -999,14 +1264,20 @@ static void on_menu(lv_event_t *e)
 {
     void *ud = lv_event_get_user_data(e);
     if (ud == (void *)(intptr_t)3) {
-        /* re-provision: clear creds + restart into SoftAP */
-        app_config_clear_credentials();
-        esp_restart();
+        /* Only this confirmation page may clear credentials. */
+        if (s_screen != SCR_REPROVISION_CONFIRM) return;
+        if (app_config_clear_credentials() == ESP_OK) {
+            esp_restart();
+        } else {
+            for (int i = 0; i < s_pref_status_count; i++) {
+                lv_label_set_text(s_pref_status[i], "Could not clear credentials");
+            }
+        }
         return;
     }
     if (s_screen == SCR_HOME) {
-        refresh_settings(s_card_count, panel_store_conn_state());
-        show_screen(SCR_SETTINGS);
+        refresh_prefs_ui();
+        show_screen(SCR_QUICK);
     }
 }
 
@@ -1016,6 +1287,7 @@ static void on_back(lv_event_t *e)
     if (s_screen == SCR_DETAIL) {
         bump_epoch();
         s_sel_term[0] = '\0';
+        panel_store_set_view_context(s_page, NULL);
         /* tell the worker to stop polling this detail */
         panel_cmd_t cmd = { .type = PANEL_CMD_CLOSE_DETAIL };
         panel_store_enqueue_control(&cmd);
@@ -1025,6 +1297,107 @@ static void on_back(lv_event_t *e)
     } else if (s_screen == SCR_CONFIRM) {
         s_pending_action = PANEL_ACT_NONE;
         show_screen(SCR_DETAIL);
+    }
+}
+
+static void on_settings_nav(lv_event_t *e)
+{
+    screen_t target = (screen_t)(intptr_t)lv_event_get_user_data(e);
+    refresh_prefs_ui();
+    show_screen(target);
+}
+
+static bool queue_pref(panel_pref_field_t field, int value)
+{
+    panel_cmd_t cmd = {
+        .type = PANEL_CMD_SET_PREF,
+        .pref_field = field,
+        .pref_value = value,
+        .edit_id = ++s_edit_id,
+    };
+    if (!panel_store_enqueue_control(&cmd)) {
+        for (int i = 0; i < s_pref_status_count; i++) {
+            lv_label_set_text(s_pref_status[i], "Busy; setting not saved");
+        }
+        panel_prefs_t p;
+        panel_prefs_get(&p);
+        panel_display_set_brightness(p.brightness);
+        panel_audio_set_volume(p.sound_volume);
+        refresh_prefs_ui();
+        return false;
+    }
+    for (int i = 0; i < s_pref_status_count; i++) {
+        lv_label_set_text(s_pref_status[i], "Saving...");
+    }
+    return true;
+}
+
+static void on_pref_click(lv_event_t *e)
+{
+    panel_pref_field_t field = (panel_pref_field_t)((intptr_t)lv_event_get_user_data(e) - 1);
+    panel_prefs_t p;
+    panel_prefs_get(&p);
+    int v = panel_prefs_value(&p, field);
+    int next = v;
+    switch (field) {
+    case PANEL_PREF_SOUND_ENABLED: case PANEL_PREF_SOUND_REQUEST:
+    case PANEL_PREF_SOUND_DONE: case PANEL_PREF_QUIET_ENABLED:
+    case PANEL_PREF_REDUCE_MOTION: case PANEL_PREF_VISUAL_ALERT:
+    case PANEL_PREF_HIDE_IDLE: next = !v; break;
+    case PANEL_PREF_SOUND_SCOPE: case PANEL_PREF_SOUND_CLAUDE:
+    case PANEL_PREF_SOUND_OPENCODE: case PANEL_PREF_SOUND_PI:
+    case PANEL_PREF_CARD_ORDER: next = (v + 1) % 3; break;
+    case PANEL_PREF_QUIET_START: case PANEL_PREF_QUIET_END:
+        next = (v + 15) % 1440; break;
+    case PANEL_PREF_UTC_OFFSET: next = v >= 840 ? -720 : v + 15; break;
+    case PANEL_PREF_IDLE_DIM_SECONDS:
+        next = v == 0 ? 30 : v == 30 ? 60 :
+               v == 60 ? 120 : v == 120 ? 300 : 0;
+        break;
+    case PANEL_PREF_DIM_BRIGHTNESS: next = v >= 50 ? 5 : v + 5; break;
+    case PANEL_PREF_OVERVIEW_INTERVAL:
+        next = v == 2 ? 3 : v == 3 ? 5 : v == 5 ? 10 : 2;
+        break;
+    default: return;
+    }
+    if (field == PANEL_PREF_SOUND_ENABLED && next == 0) panel_audio_stop();
+    queue_pref(field, next);
+}
+
+static void on_pref_slider(lv_event_t *e)
+{
+    panel_pref_field_t field = (panel_pref_field_t)((intptr_t)lv_event_get_user_data(e) - 1);
+    lv_obj_t *slider = lv_event_get_target(e);
+    int value = lv_slider_get_value(slider);
+    int step = field == PANEL_PREF_BRIGHTNESS ? 5 : 10;
+    value = ((value + step / 2) / step) * step;
+    if (field == PANEL_PREF_BRIGHTNESS) {
+        if (value < 10) value = 10;
+        panel_display_set_brightness((uint8_t)value);
+    } else if (field == PANEL_PREF_SOUND_VOLUME) {
+        static int64_t last_preview_ms;
+        int64_t now_ms = ui_now_ms();
+        if (lv_event_get_code(e) == LV_EVENT_RELEASED ||
+            now_ms - last_preview_ms >= 150) {
+            panel_audio_set_volume((uint8_t)value);
+            last_preview_ms = now_ms;
+        }
+    }
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) queue_pref(field, value);
+}
+
+static void on_sound_test(lv_event_t *e)
+{
+    panel_prefs_t prefs;
+    panel_prefs_get(&prefs);
+    if (!panel_audio_ready()) {
+        lv_label_set_text(s_sound_status, "Sound unavailable; check speaker");
+    } else if (lv_slider_get_value(s_sound_volume) == 0) {
+        lv_label_set_text(s_sound_status, "Raise volume to test sound");
+    } else {
+        bool queued = panel_audio_play((panel_audio_kind_t)(intptr_t)lv_event_get_user_data(e));
+        lv_label_set_text(s_sound_status, queued ?
+                          "Test only; mute setting unchanged" : "Sound busy; try again");
     }
 }
 
@@ -1042,6 +1415,7 @@ static void on_jump_blocked(lv_event_t *e)
     int idx = panel_store_first_blocked_index();
     if (idx >= 0) {
         s_page = idx / PAGE_SIZE;
+        panel_store_set_view_context(s_page, s_sel_term);
         s_seen_generation = 0;  /* force redraw on next tick */
     }
 }
@@ -1064,7 +1438,12 @@ static void on_action_btn(lv_event_t *e)
     if (!panel_store_get_detail(&det)) return;
     /* the stored detail must still be the session the user is looking at;
      * the worker already discards responses with a stale selection epoch */
-    if (strcmp(det.terminal_id, s_sel_term) != 0) return;
+    if (strcmp(det.terminal_id, s_sel_term) != 0 ||
+        det.selection_epoch != s_sel_epoch || det.gone ||
+        panel_store_conn_state() != PANEL_CONN_ONLINE ||
+        det.fetched_at_ms <= 0 ||
+        ui_now_ms() - det.fetched_at_ms > 10000 ||
+        !(det.pending.choices & action_choice(act))) return;
     /* freeze card; confirm page shows impact */
     show_confirm(act, &det);
 }
@@ -1079,7 +1458,12 @@ static void on_confirm_cancel(lv_event_t *e)
 static void on_confirm_ok(lv_event_t *e)
 {
     (void)e;
-    if (s_pending_action == PANEL_ACT_NONE) return;
+    if (!confirmed_request_current()) {
+        s_pending_action = PANEL_ACT_NONE;
+        show_screen(SCR_DETAIL);
+        lv_label_set_text(s_det_hint, "Request changed or expired; refresh and review");
+        return;
+    }
     if (panel_store_action_reserved()) {
         show_result(&(panel_action_result_t){
             .state = PANEL_ACTION_SENDING,
@@ -1088,12 +1472,6 @@ static void on_confirm_ok(lv_event_t *e)
     }
     if (!panel_store_try_reserve_action()) {
         lv_label_set_text(s_cnf_hint, "Busy, try later");
-        return;
-    }
-
-    panel_detail_t det;
-    if (!panel_store_get_detail(&det)) {
-        panel_store_release_action();
         return;
     }
 
@@ -1142,7 +1520,10 @@ void ui_panel_init(void)
     build_confirm();
     build_result();
     build_settings();
+    build_pref_pages();
     build_provision();
+    panel_store_set_view_context(s_page, NULL);
+    refresh_prefs_ui();
     show_screen(SCR_HOME);
 }
 
@@ -1160,7 +1541,37 @@ void ui_panel_tick(void)
             if (s_screen == SCR_CONFIRM || s_screen == SCR_RESULT) {
                 show_result(&evt.action);
             }
+        } else if (evt.type == PANEL_EVT_CONFIG_RESULT) {
+            panel_prefs_t p;
+            panel_prefs_get(&p);
+            if (evt.pref_field == PANEL_PREF_BRIGHTNESS) {
+                panel_display_set_brightness(p.brightness);
+            }
+            refresh_prefs_ui();
+            s_seen_generation = 0;
+            for (int i = 0; i < s_pref_status_count; i++) {
+                lv_label_set_text(s_pref_status[i], evt.message);
+            }
         }
+    }
+
+    if (s_screen == SCR_CONFIRM && !confirmed_request_current()) {
+        s_pending_action = PANEL_ACT_NONE;
+        show_screen(SCR_DETAIL);
+        lv_label_set_text(s_det_hint, "Request changed or expired; refresh and review");
+    }
+
+    panel_prefs_t display_prefs;
+    panel_prefs_get(&display_prefs);
+    bool should_dim = display_prefs.idle_dim_seconds != 0 &&
+        s_screen != SCR_CONFIRM && s_screen != SCR_PROVISION &&
+        lv_display_get_inactive_time(NULL) >=
+            (uint32_t)display_prefs.idle_dim_seconds * 1000u;
+    if (should_dim != s_dimmed) {
+        s_dimmed = should_dim;
+        panel_display_set_brightness(should_dim ?
+                                     display_prefs.dim_brightness :
+                                     display_prefs.brightness);
     }
 
     /* 2. redraw when store generation changed */
@@ -1168,7 +1579,8 @@ void ui_panel_tick(void)
     bool gen_changed = (gen != s_seen_generation);
     s_seen_generation = gen;
 
-    if (s_screen == SCR_HOME || s_screen == SCR_SETTINGS) {
+    if (s_screen == SCR_HOME) {
+        update_alert_pulses();
         if (!gen_changed) return;
 
         panel_agent_card_t cards[4];
@@ -1183,14 +1595,11 @@ void ui_panel_tick(void)
         if (s_page >= pages) {
             s_page = pages - 1;
             panel_store_get_page(cards, s_page, &count, &total, &conn);
+            panel_store_set_view_context(s_page, s_sel_term);
         }
         if (s_page < 0) s_page = 0;
 
-        if (s_screen == SCR_HOME) {
-            refresh_home(cards, count, total, conn);
-        } else {
-            refresh_settings(count, conn);
-        }
+        refresh_home(cards, count, total, conn);
         return;
     }
 

@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_netif_sntp.h"
 #include "sdkconfig.h"
 
 #include "driver/gpio.h"
@@ -22,6 +23,9 @@
 
 #include "user_config.h"
 #include "app_config.h"
+#include "panel_display.h"
+#include "panel_audio.h"
+#include "panel_prefs.h"
 #include "panel_store.h"
 #include "panel_worker.h"
 #include "provisioning.h"
@@ -32,6 +36,11 @@ static const char *TAG = "herdr_panel";
 
 I2cMasterBus user_i2cbus(BSP_I2C_SCL, BSP_I2C_SDA, BSP_I2C_NUM);
 DisplayPort *user_display = NULL;
+
+extern "C" void panel_display_set_brightness(uint8_t percent)
+{
+    if (user_display != NULL) user_display->Set_Backlight(percent);
+}
 
 /* ------------------------------------------------------------------ */
 /* LVGL periodic refresh (runs inside the LVGL task)                   */
@@ -53,21 +62,33 @@ extern "C" void app_main(void)
      * display rail (ALDO3) used by the panel reset sequence */
     Custom_PmicPortInit(&user_i2cbus, 0x34);
 
+    ESP_ERROR_CHECK(app_config_init());
+    ESP_ERROR_CHECK(panel_prefs_init());
+    panel_prefs_t prefs;
+    panel_prefs_get(&prefs);
+
     /* AMOLED panel */
     user_display = new DisplayPort(user_i2cbus, BSP_LCD_H_RES, BSP_LCD_V_RES,
                                    BSP_LCD_PCLK, BSP_LCD_DATA0, BSP_LCD_DATA1,
                                    BSP_LCD_DATA2, BSP_LCD_DATA3, BSP_LCD_CS,
                                    BSP_LCD_TOUCH_INT, BSP_LCD_TOUCH_RST);
     user_display->DisplayPort_TouchInit();
-    user_display->Set_Backlight(CONFIG_HERDR_DEFAULT_BRIGHTNESS);
+    panel_display_set_brightness(prefs.brightness);
 
     /* LVGL port (display + touch) */
     Lvgl_PortInit(*user_display);
 
     /* config_service owns NVS; wifi_connect relies on that single init */
-    ESP_ERROR_CHECK(app_config_init());
     panel_store_init();
+    if (!panel_audio_start(user_i2cbus.Get_I2cBusHandle())) {
+        ESP_LOGW(TAG, "audio task unavailable; visual alerts remain active");
+    }
     wifi_connect_start();       /* enters provisioning automatically when unconfigured */
+    if (!provisioning_active()) {
+        esp_sntp_config_t time_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        esp_err_t time_err = esp_netif_sntp_init(&time_cfg);
+        if (time_err != ESP_OK) ESP_LOGW(TAG, "SNTP init failed: %s", esp_err_to_name(time_err));
+    }
 
     if (Lvgl_lock(-1) == ESP_OK) {
         ui_panel_init();

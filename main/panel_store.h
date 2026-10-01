@@ -17,6 +17,7 @@
 #include "freertos/semphr.h"
 
 #include "panel_model.h"
+#include "panel_prefs.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,7 +30,7 @@ typedef enum {
     PANEL_CMD_CLOSE_DETAIL,         /* user left the detail screen */
     PANEL_CMD_REFRESH,
     PANEL_CMD_RECONNECT,
-    PANEL_CMD_SET_DISPLAY_PREF,
+    PANEL_CMD_SET_PREF,
     PANEL_CMD_ACTION,               /* goes through action_q only */
 } panel_cmd_type_t;
 
@@ -41,7 +42,9 @@ typedef struct {
     panel_action_id_t action;
     char context_token[PANEL_TOKEN_LEN];
     char prompt[PANEL_PROMPT_LEN];
-    int brightness;                 /* SET_DISPLAY_PREF */
+    panel_pref_field_t pref_field;  /* SET_PREF */
+    int pref_value;
+    uint32_t edit_id;
 } panel_cmd_t;
 
 /* ---- worker -> UI one-shot events ----------------------------------- */
@@ -55,6 +58,9 @@ typedef enum {
 typedef struct {
     panel_evt_type_t type;
     panel_action_result_t action;
+    panel_pref_field_t pref_field;
+    uint32_t edit_id;
+    bool config_saved;
     char message[PANEL_MESSAGE_LEN];
 } panel_ui_evt_t;
 
@@ -70,6 +76,8 @@ void panel_store_publish_detail(const panel_detail_t *src);
 
 /** Update connectivity without touching agent cards. */
 void panel_store_set_conn(panel_conn_state_t st, const char *message);
+void panel_store_set_sound_notice(const char *message);
+void panel_store_get_sound_notice(char *out, size_t capacity);
 
 /** Copy current overview + connection for UI (lock held briefly). */
 void panel_store_get_overview(panel_overview_t *out, panel_conn_state_t *conn_out);
@@ -98,6 +106,10 @@ int panel_store_first_blocked_index(void);
 
 /** Number of blocked cards in the stored overview. */
 int panel_store_blocked_count(void);
+
+/** UI-owned current page/selection for sound scope filtering. */
+void panel_store_set_view_context(int page, const char *selected_terminal_id);
+bool panel_store_sound_scope_match(const char *terminal_id, uint8_t scope);
 
 /* ---- queues ---------------------------------------------------------- */
 

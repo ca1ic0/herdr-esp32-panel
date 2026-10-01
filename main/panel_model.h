@@ -25,6 +25,7 @@ extern "C" {
 #define PANEL_NAME_LEN          48
 #define PANEL_LABEL_LEN         32
 #define PANEL_STATUS_STR_LEN    24
+#define PANEL_UPDATED_LEN       32
 #define PANEL_SERVER_ID_LEN     48
 #define PANEL_TOKEN_LEN         96
 #define PANEL_SUMMARY_LEN       160
@@ -34,6 +35,8 @@ extern "C" {
 #define PANEL_OUTPUT_LINE_LEN   96
 #define PANEL_REQUEST_ID_LEN    40   /* 128-bit formatted id + NUL */
 #define PANEL_MESSAGE_LEN       96
+#define PANEL_EVENT_ID_LEN      48
+#define PANEL_EVENT_MAX         16
 
 /* ---- Herdr agent status (raw values, never rewritten) ---------------- */
 
@@ -106,6 +109,7 @@ typedef struct {
     panel_agent_state_t herdr_status;
     char status_raw[PANEL_STATUS_STR_LEN];
     uint32_t revision;
+    char updated_at[PANEL_UPDATED_LEN];
 } panel_agent_card_t;
 
 typedef struct {
@@ -163,6 +167,24 @@ typedef struct {
     char message[PANEL_MESSAGE_LEN];
     uint32_t selection_epoch;
 } panel_action_result_t;
+
+typedef struct {
+    char event_id[PANEL_EVENT_ID_LEN];
+    char terminal_id[PANEL_TERM_ID_LEN];
+    char agent[PANEL_AGENT_LEN];
+    uint8_t kind;                   /* 1 request, 2 done */
+    uint32_t age_ms;                /* gateway-computed age at response time */
+} panel_notice_t;
+
+typedef struct {
+    char server_id[PANEL_SERVER_ID_LEN];
+    char latest_cursor[PANEL_EVENT_ID_LEN];
+    char next_cursor[PANEL_EVENT_ID_LEN];
+    bool gap;
+    bool has_more;
+    uint8_t count;
+    panel_notice_t events[PANEL_EVENT_MAX];
+} panel_event_batch_t;
 
 /* ---- helpers ---------------------------------------------------------- */
 

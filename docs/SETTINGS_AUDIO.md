@@ -1,6 +1,6 @@
 # 运行时设置与声音交互规格
 
-版本：v2 目标规格（2026-10-01）。给实现 ESP-IDF 固件、主机 panel 网关和验收用的 AI 阅读。**本文件定义应实现的行为，不表示当前固件已实现。**产品/页面/模块的上层约束分别见 [PRODUCT_LOGIC.md](PRODUCT_LOGIC.md)、[UI_DESIGN.md](UI_DESIGN.md)、[ARCHITECTURE.md](ARCHITECTURE.md)。
+版本：v2 目标规格（2026-10-01）。给实现 ESP-IDF 固件、主机 panel 网关和验收用的 AI 阅读。本文件同时包含已落地功能及后续验收目标；具体进度见末尾“实施状态”。产品/页面/模块的上层约束分别见 [PRODUCT_LOGIC.md](PRODUCT_LOGIC.md)、[UI_DESIGN.md](UI_DESIGN.md)、[ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 1. 真实能力与目标
 
@@ -70,18 +70,19 @@ Wi-Fi SSID/密码、网关 URL/token 是连接配置，不走音量设置通道�
 {
   "schema_version": 1,
   "server_id": "host-a-boot-42",
-  "latest_cursor": "evt-0094",
-  "next_cursor": "evt-0094",
+  "latest_cursor": "evt-0000000000000094",
+  "next_cursor": "evt-0000000000000094",
   "has_more": false,
   "gap": false,
   "events": [
     {
-      "event_id": "evt-0094",
+      "event_id": "evt-0000000000000094",
       "terminal_id": "term-a",
       "agent": "claude",
       "kind": "request",
       "source": "herdr_notification",
-      "occurred_at": "2026-10-01T10:00:00Z"
+      "occurred_at": "2026-10-01T10:00:00Z",
+      "age_ms": 350
     }
   ]
 }
@@ -90,6 +91,8 @@ Wi-Fi SSID/密码、网关 URL/token 是连接配置，不走音量设置通道�
 `kind` 仅 `request|done`；`source` 为 `herdr_notification|state_transition`。网关若拿不到 Herdr 原生通知事件，必须在服务端按 `server_id + terminal_id + agent` 保存前次状态，只对可靠转移生成近似事件；不能把每个当前 `blocked` 或 `done` 都变成新事件。事件 ID 在同一 `server_id` 中严格有序，保留至少 10 分钟、至少 256 条。`after` 缺失表示**建立基线**：只返回最新游标，不返回历史事件，`next_cursor=latest_cursor`。后续带游标仅返回更晚的事件，按顺序最多 16 条；`next_cursor` 是本页最后一条的 ID，`has_more=true` 时设备继续以它请求下一页，**不能跳到 `latest_cursor` 丢弃中间事件**。游标超出保留期返回 `gap=true`、最新游标、空事件，此时 `next_cursor=latest_cursor`；设备显示“提醒可能遗漏”但不补播。`server_id` 变化时设备丢弃旧游标、重新建立基线。网关不返回终端输出、审批文本或音频字节。
 
 设备成功解析完整一页响应后按顺序过滤事件，再把 `next_cursor` 写入内存；队列满记录丢弃计数并仍推进游标，不让通知拖慢决策动作。HTTP 超时或畸形响应不推进游标。重复 `event_id`、乱序、超过 30 秒的事件不播放；不把收到事件的时间当发生时间。时钟未同步时，网关可另给可信事件 age 或设备保守不播过期不明事件；免打扰时间功能在时钟未同步时采取静音并提示“时间未同步”。正常模式下每 2 秒拉事件；优先级低于动作/详情，高于普通 overview 刷新。无法连接事件 API 时显示视觉状态但不自行把状态快照当音效事件。
+
+`age_ms` 是必填字段，由网关按自身时钟计算。设备据此丢弃旧事件，不依赖首次开机尚未同步的时钟。
 
 ## 6. 播放任务与故障处理
 
@@ -114,3 +117,10 @@ panel_worker ── 已鉴权事件 ──> event_filter ── 有界 audio_q(4
 6. 断电发生在音量设置 NVS 提交前：重启使用上次已保存音量，不显示“已保存”。亮度与音量连续快速调整不应彼此覆盖。
 
 完整验收清单见 [ACCEPTANCE.md](ACCEPTANCE.md)。
+
+## 8. 实施状态（2026-10-01）
+
+- 固件已接入分组设置、NVS 持久化、静音/音量/亮度即时预览、降亮、减少页面动效、待处理卡片脉冲、试听、ES8311/I2S PCM 播放及事件游标过滤。`panel_worker` 是网络与 NVS 写入者，音频任务独占 codec/I2S。
+- 相邻 `herdr-restful` 网关已提供鉴权的 `/events`，从成功读取的完整 Herdr 快照生成 `state_transition` 事件；**尚无 Herdr 原生通知源**，因此时机与桌面端不能保证完全相同。
+- 屏幕“编辑连接”和手机编辑 `continue_prompt` 尚未实现；当前继续文本仍取主机网关配置。配置服务使用字段级合并，滑杆松手后保存，尚未加入 500 ms 写入合并。
+- 本地没有 ESP-IDF 工具链和成品硬件。固件编译交由 GitHub Actions；扬声器焊接、I2S 引脚、显示芯片、音量听感、触摸与二维码仍须真机验收。不能仅凭代码或网关单元测试宣称这些项目通过。

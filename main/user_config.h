@@ -35,4 +35,11 @@
 #define BSP_LCD_TOUCH_RST       (GPIO_NUM_11)
 #define BSP_LCD_TOUCH_INT       (GPIO_NUM_5)
 
+/* ES8311 I2S TX: Waveshare 07_Audio_Test example pin map. Confirm on the
+ * assembled board before claiming audible output; speaker uses 2PIN pad. */
+#define BSP_I2S_SCLK            (GPIO_NUM_20)
+#define BSP_I2S_MCLK            (GPIO_NUM_19)
+#define BSP_I2S_LCLK            (GPIO_NUM_22)
+#define BSP_I2S_DOUT            (GPIO_NUM_23)
+
 #endif /* USER_CONFIG_H */

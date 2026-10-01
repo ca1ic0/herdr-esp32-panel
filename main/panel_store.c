@@ -8,6 +8,7 @@ static panel_overview_t s_overview;
 static panel_detail_t s_detail;
 static panel_conn_state_t s_conn = PANEL_CONN_WIFI_CONNECTING;
 static char s_conn_msg[PANEL_MESSAGE_LEN];
+static char s_sound_notice[PANEL_MESSAGE_LEN];
 static volatile uint32_t s_generation;
 
 static QueueHandle_t s_action_q;    /* capacity 1 */
@@ -15,6 +16,40 @@ static QueueHandle_t s_control_q;   /* capacity 4 */
 static QueueHandle_t s_ui_evt_q;    /* capacity 8 */
 
 static volatile bool s_action_reserved;
+static int s_view_page;
+static char s_view_term[PANEL_TERM_ID_LEN];
+
+/* Called with s_lock held. Stable insertion sort keeps gateway order when
+ * priority values are equal, and the tiny 24-entry index fits on stack. */
+static int visible_index_locked(const panel_prefs_t *prefs, int index[PANEL_MAX_AGENTS])
+{
+    int n = 0;
+    for (int i = 0; i < s_overview.count && i < PANEL_MAX_AGENTS; i++) {
+        if (prefs->hide_idle &&
+            s_overview.agents[i].herdr_status == PANEL_AGENT_IDLE) continue;
+        index[n++] = i;
+    }
+    for (int i = 1; i < n; i++) {
+        int cur = index[i];
+        int j = i;
+        while (j > 0) {
+            const panel_agent_card_t *a = &s_overview.agents[cur];
+            const panel_agent_card_t *b = &s_overview.agents[index[j - 1]];
+            bool before = false;
+            if (prefs->card_order == PANEL_ORDER_BLOCKED) {
+                before = a->herdr_status == PANEL_AGENT_BLOCKED &&
+                         b->herdr_status != PANEL_AGENT_BLOCKED;
+            } else if (prefs->card_order == PANEL_ORDER_RECENT) {
+                before = strcmp(a->updated_at, b->updated_at) > 0;
+            }
+            if (!before) break;
+            index[j] = index[j - 1];
+            j--;
+        }
+        index[j] = cur;
+    }
+    return n;
+}
 
 void panel_store_init(void)
 {
@@ -22,6 +57,7 @@ void panel_store_init(void)
     memset(&s_overview, 0, sizeof(s_overview));
     memset(&s_detail, 0, sizeof(s_detail));
     s_conn_msg[0] = '\0';
+    s_sound_notice[0] = '\0';
     s_generation = 1;
 
     s_action_q = xQueueCreate(1, sizeof(panel_cmd_t));
@@ -59,6 +95,29 @@ void panel_store_set_conn(panel_conn_state_t st, const char *message)
             s_generation++;
         }
         snprintf(s_conn_msg, sizeof(s_conn_msg), "%s", message != NULL ? message : "");
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void panel_store_set_sound_notice(const char *message)
+{
+    if (s_lock == NULL) return;
+    const char *value = message != NULL ? message : "";
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (strncmp(s_sound_notice, value, sizeof(s_sound_notice)) != 0) {
+            snprintf(s_sound_notice, sizeof(s_sound_notice), "%s", value);
+            s_generation++;
+        }
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void panel_store_get_sound_notice(char *out, size_t capacity)
+{
+    if (out == NULL || capacity == 0) return;
+    out[0] = '\0';
+    if (s_lock != NULL && xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        snprintf(out, capacity, "%s", s_sound_notice);
         xSemaphoreGive(s_lock);
     }
 }
@@ -103,16 +162,19 @@ int panel_store_get_page(panel_agent_card_t out4[4], int page,
     if (out4 == NULL) return 0;
     memset(out4, 0, 4 * sizeof(*out4));
     if (s_lock == NULL) return 0;
+    panel_prefs_t prefs;
+    panel_prefs_get(&prefs);
     int count = 0;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
-        count = s_overview.count;
+        int index[PANEL_MAX_AGENTS];
+        count = visible_index_locked(&prefs, index);
         for (int i = 0; i < 4; i++) {
             int idx = page * 4 + i;
-            if (idx >= 0 && idx < s_overview.count) {
-                out4[i] = s_overview.agents[idx];
+            if (idx >= 0 && idx < count) {
+                out4[i] = s_overview.agents[index[idx]];
             }
         }
-        if (count_out != NULL) *count_out = s_overview.count;
+        if (count_out != NULL) *count_out = count;
         if (total_out != NULL) *total_out = s_overview.total_count;
         if (conn_out != NULL) *conn_out = s_conn;
         xSemaphoreGive(s_lock);
@@ -134,10 +196,14 @@ panel_conn_state_t panel_store_conn_state(void)
 int panel_store_first_blocked_index(void)
 {
     if (s_lock == NULL) return -1;
+    panel_prefs_t prefs;
+    panel_prefs_get(&prefs);
     int found = -1;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
-        for (int i = 0; i < s_overview.count; i++) {
-            if (s_overview.agents[i].herdr_status == PANEL_AGENT_BLOCKED) {
+        int index[PANEL_MAX_AGENTS];
+        int n = visible_index_locked(&prefs, index);
+        for (int i = 0; i < n; i++) {
+            if (s_overview.agents[index[i]].herdr_status == PANEL_AGENT_BLOCKED) {
                 found = i;
                 break;
             }
@@ -158,6 +224,42 @@ int panel_store_blocked_count(void)
         xSemaphoreGive(s_lock);
     }
     return n;
+}
+
+void panel_store_set_view_context(int page, const char *selected_terminal_id)
+{
+    if (s_lock == NULL) return;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s_view_page = page;
+        snprintf(s_view_term, sizeof(s_view_term), "%s",
+                 selected_terminal_id != NULL ? selected_terminal_id : "");
+        xSemaphoreGive(s_lock);
+    }
+}
+
+bool panel_store_sound_scope_match(const char *terminal_id, uint8_t scope)
+{
+    if (terminal_id == NULL || s_lock == NULL) return false;
+    if (scope == PANEL_SOUND_ALL) return true;
+    panel_prefs_t prefs;
+    panel_prefs_get(&prefs);
+    bool match = false;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        if (scope == PANEL_SOUND_SELECTED) {
+            match = s_view_term[0] && strcmp(s_view_term, terminal_id) == 0;
+        } else if (scope == PANEL_SOUND_PAGE) {
+            int index[PANEL_MAX_AGENTS];
+            int n = visible_index_locked(&prefs, index);
+            for (int i = s_view_page * 4; i < s_view_page * 4 + 4 && i < n; i++) {
+                if (strcmp(s_overview.agents[index[i]].terminal_id, terminal_id) == 0) {
+                    match = true;
+                    break;
+                }
+            }
+        }
+        xSemaphoreGive(s_lock);
+    }
+    return match;
 }
 
 bool panel_store_enqueue_action(const panel_cmd_t *cmd)
