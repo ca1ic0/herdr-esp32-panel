@@ -1,10 +1,10 @@
 /*
- * Provisioning mode: SoftAP + captive-portal DNS + embedded config web page.
+ * Provisioning mode: WPA2 SoftAP + captive-portal DNS + config web page.
  *
- * - SoftAP "HerdrPanel-XXXX" (open network; join via on-screen QR code)
- * - DNS server answers every A query with our own IP (captive portal)
- * - HTTP server serves a small form: WiFi SSID/password + backend host/port
- * - On submit the config is saved to NVS and the device reboots
+ * - SoftAP "HerdrPanel-XXXX" with a random 8-char WPA2 password
+ * - QR code encodes only the AP join payload
+ * - Form fields: Wi-Fi SSID/password, gateway host/port, device token
+ * - On submit: validate → NVS → respond → tear down → restart
  */
 
 #include "provisioning.h"
@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "lwip/sockets.h"
@@ -32,67 +33,84 @@ static const char *TAG = "provisioning";
 #define AP_CHANNEL      1
 #define DNS_PORT        53
 #define HTTP_PORT       80
+#define AP_PASS_LEN     8
 
 static bool s_active;
 static httpd_handle_t s_httpd;
 static TaskHandle_t s_dns_task;
 static char s_ap_ssid[24];
+static char s_ap_pass[AP_PASS_LEN + 1];
 
 /* ------------------------------------------------------------------ */
-/* HTML page (single file, no external assets)                         */
+/* HTML page                                                           */
 /* ------------------------------------------------------------------ */
 
 static const char PAGE_HTML[] =
 "<!DOCTYPE html><html><head><meta charset='utf-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
 "<title>Herdr Panel Setup</title><style>"
-"body{font-family:sans-serif;background:#0f1419;color:#d7dee7;margin:0;padding:24px}"
-"h1{font-size:20px;margin:0 0 16px}"
-"label{display:block;font-size:13px;color:#8494a5;margin:12px 0 4px}"
+"body{font-family:sans-serif;background:#080D12;color:#F2F6FA;margin:0;padding:24px}"
+"h1{font-size:20px;margin:0 0 8px}"
+"p.hint{color:#AEBCC9;font-size:13px;margin:0 0 16px}"
+"label{display:block;font-size:13px;color:#AEBCC9;margin:12px 0 4px}"
 "input{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;"
-"border:1px solid #27313c;background:#161c23;color:#d7dee7;font-size:15px}"
+"border:1px solid #293643;background:#151E27;color:#F2F6FA;font-size:15px}"
 ".row{display:flex;gap:8px;align-items:center}"
 ".row input{flex:1}"
 ".scan{margin:0;flex:0 0 auto;width:auto;padding:10px 16px;border-radius:8px;"
-"border:1px solid #4c9aff;background:transparent;color:#4c9aff;font-size:14px}"
+"border:1px solid #69B5FF;background:transparent;color:#69B5FF;font-size:14px}"
 ".scan:disabled{opacity:.5}"
-"#ssids{list-style:none;padding:0;margin:8px 0 0;max-height:200px;overflow:auto}"
-"#ssids li{padding:10px 12px;background:#161c23;border:1px solid #27313c;"
+"#ssids{list-style:none;padding:0;margin:8px 0 0;max-height:180px;overflow:auto}"
+"#ssids li{padding:10px 12px;background:#151E27;border:1px solid #293643;"
 "border-radius:8px;margin-bottom:6px;font-size:15px}"
 "button[type=submit]{margin-top:20px;width:100%;padding:12px;border:0;border-radius:8px;"
-"background:#4c9aff;color:#fff;font-size:16px}"
-"#msg{margin-top:12px;font-size:13px;color:#57ab5a}"
-"</style></head><body><h1>Herdr Panel 配网</h1>"
+"background:#69B5FF;color:#080D12;font-size:16px;font-weight:600}"
+"#msg{margin-top:12px;font-size:13px;color:#FF6B68}"
+".token{font-family:monospace;letter-spacing:.5px}"
+"</style></head><body><h1>Herdr Panel Setup</h1>"
+"<p class='hint'>Enter your home Wi-Fi and gateway info. Generate the device token on the host gateway first.</p>"
 "<form method='POST' action='/save'>"
-"<label>WiFi SSID</label><div class='row'>"
-"<input name='ssid' id='ssid' required>"
-"<button type='button' class='scan' id='scanBtn' onclick='doScan()'>扫描</button></div>"
+"<label>Wi-Fi SSID</label><div class='row'>"
+"<input name='ssid' id='ssid' required maxlength='32'>"
+"<button type='button' class='scan' id='scanBtn' onclick='doScan()'>Scan</button></div>"
 "<ul id='ssids'></ul>"
-"<label>WiFi 密码</label><input name='pass' type='password'>"
-"<label>后端地址 (IP 或主机名)</label><input name='host' required>"
-"<label>后端端口</label><input name='port' type='number' value='8080' required>"
-"<button type='submit'>保存并重启</button><div id='msg'></div></form>"
+"<label>Wi-Fi Password</label><input name='pass' type='password' maxlength='64'>"
+"<label>Gateway host (IP or hostname)</label><input name='host' required maxlength='63'>"
+"<label>Gateway port</label><input name='port' type='number' value='8080' required min='1' max='65535'>"
+"<label>Device gateway token (required)</label>"
+"<input name='token' type='password' class='token' required maxlength='95' "
+"placeholder='Per-device token from the host gateway'>"
+"<button type='submit'>Save and restart</button><div id='msg'></div></form>"
 "<script>"
 "function doScan(){"
-" var b=document.getElementById('scanBtn');b.disabled=true;b.textContent='扫描中…';"
-" var ul=document.getElementById('ssids');ul.innerHTML='<li>扫描中…</li>';"
+" var b=document.getElementById('scanBtn');b.disabled=true;b.textContent='Scanning...';"
+" var ul=document.getElementById('ssids');ul.innerHTML='<li>Scanning...</li>';"
 " fetch('/scan').then(function(r){return r.json()}).then(function(d){"
 "  ul.innerHTML='';var ss=d.ssids||[];"
-"  if(!ss.length){ul.innerHTML='<li>未发现网络</li>';return}"
+"  if(!ss.length){ul.innerHTML='<li>No networks found</li>';return}"
 "  ss.forEach(function(n){var li=document.createElement('li');"
 "   li.textContent=n;li.onclick=function(){document.getElementById('ssid').value=n};"
 "   ul.appendChild(li)});"
-" }).catch(function(){ul.innerHTML='<li>扫描失败</li>'})"
-"  .then(function(){b.disabled=false;b.textContent='扫描'});"
+" }).catch(function(){ul.innerHTML='<li>Scan failed</li>'})"
+"  .then(function(){b.disabled=false;b.textContent='Scan'});"
 "}"
 "</script></body></html>";
 
 static const char DONE_HTML[] =
-"<!DOCTYPE html><html><head><meta charset='utf-8'></head><body style='font-family:sans-serif'>"
-"<h2>已保存，设备正在重启…</h2><p>可以断开此热点，稍后在 herdr 面板屏幕上查看连接状态。</p></body></html>";
+"<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
+"<body style='font-family:sans-serif;background:#080D12;color:#F2F6FA;padding:24px'>"
+"<h2>Configuration saved</h2>"
+"<p>The device is connecting to Wi-Fi. If the server is unreachable the screen will say so; re-enter setup to edit.</p>"
+"<p>You can now disconnect from the device hotspot.</p></body></html>";
+
+static const char ERR_HTML[] =
+"<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
+"<body style='font-family:sans-serif;background:#080D12;color:#FF6B68;padding:24px'>"
+"<h2>Save failed</h2><p id='e'>Check the fields and try again.</p>"
+"<p><a href='/' style='color:#69B5FF'>Back</a></p></body></html>";
 
 /* ------------------------------------------------------------------ */
-/* DNS server: answer every A query with our AP address (captive)      */
+/* DNS captive portal                                                  */
 /* ------------------------------------------------------------------ */
 
 static void dns_task(void *arg)
@@ -117,28 +135,23 @@ static void dns_task(void *arg)
         struct sockaddr_in src;
         socklen_t slen = sizeof(src);
         int len = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&src, &slen);
-        if (len < 12) {
-            continue;
-        }
-        /* build a minimal DNS response: copy question, answer = our IP */
-        buf[2] = 0x81;              /* response + recursion available */
+        if (len < 12) continue;
+        buf[2] = 0x81;
         buf[3] = 0x80;
-        buf[6] = 0x00; buf[7] = 0x01;   /* 1 answer */
+        buf[6] = 0x00; buf[7] = 0x01;
         int off = len;
-        if (off + 16 > (int)sizeof(buf)) {
-            continue;
-        }
-        buf[off++] = 0xC0; buf[off++] = 0x0C;   /* pointer to question name */
-        buf[off++] = 0x00; buf[off++] = 0x01;   /* type A */
-        buf[off++] = 0x00; buf[off++] = 0x01;   /* class IN */
-        buf[off++] = 0x00; buf[off++] = 0x00; buf[off++] = 0x00; buf[off++] = 0x3C; /* TTL 60 */
-        buf[off++] = 0x00; buf[off++] = 0x04;   /* length 4 */
+        if (off + 16 > (int)sizeof(buf)) continue;
+        buf[off++] = 0xC0; buf[off++] = 0x0C;
+        buf[off++] = 0x00; buf[off++] = 0x01;
+        buf[off++] = 0x00; buf[off++] = 0x01;
+        buf[off++] = 0x00; buf[off++] = 0x00; buf[off++] = 0x00; buf[off++] = 0x3C;
+        buf[off++] = 0x00; buf[off++] = 0x04;
         esp_netif_ip_info_t ip;
         esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
         if (netif != NULL) {
             esp_netif_get_ip_info(netif, &ip);
         } else {
-            ip.ip.addr = htonl(0xC0A80401);     /* 192.168.4.1 fallback */
+            ip.ip.addr = htonl(0xC0A80401);
         }
         memcpy(&buf[off], &ip.ip.addr, 4);
         off += 4;
@@ -149,7 +162,7 @@ static void dns_task(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
-/* HTTP config page                                                    */
+/* HTTP handlers                                                       */
 /* ------------------------------------------------------------------ */
 
 static esp_err_t handle_root(httpd_req_t *req)
@@ -160,7 +173,6 @@ static esp_err_t handle_root(httpd_req_t *req)
 
 static esp_err_t handle_scan(httpd_req_t *req)
 {
-    /* synchronous WiFi scan of surrounding APs */
     wifi_scan_config_t scfg = { .show_hidden = false };
     esp_wifi_scan_start(&scfg, true);
 
@@ -187,7 +199,6 @@ static esp_err_t handle_scan(httpd_req_t *req)
     return httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
 }
 
-/* minimal url-decode of form values */
 static void url_decode(char *s)
 {
     char *o = s;
@@ -210,9 +221,7 @@ static bool form_get(const char *body, const char *key, char *out, size_t out_le
     char pat[32];
     snprintf(pat, sizeof(pat), "%s=", key);
     const char *p = strstr(body, pat);
-    if (p == NULL) {
-        return false;
-    }
+    if (p == NULL) return false;
     p += strlen(pat);
     size_t i = 0;
     while (*p && *p != '&' && i + 1 < out_len) {
@@ -225,7 +234,7 @@ static bool form_get(const char *body, const char *key, char *out, size_t out_le
 
 static esp_err_t handle_save(httpd_req_t *req)
 {
-    char body[512];
+    char body[768];
     int total = req->content_len;
     if (total <= 0 || total >= (int)sizeof(body)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
@@ -245,7 +254,7 @@ static esp_err_t handle_save(httpd_req_t *req)
     app_config_t cfg;
     app_config_get(&cfg);
 
-    char tmp[80];
+    char tmp[128];
     if (form_get(body, "ssid", tmp, sizeof(tmp))) {
         snprintf(cfg.wifi_ssid, sizeof(cfg.wifi_ssid), "%.32s", tmp);
     }
@@ -261,20 +270,35 @@ static esp_err_t handle_save(httpd_req_t *req)
             cfg.backend_port = (uint16_t)port;
         }
     }
+    if (form_get(body, "token", tmp, sizeof(tmp))) {
+        snprintf(cfg.gateway_token, sizeof(cfg.gateway_token), "%.95s", tmp);
+    }
+
+    /* Required fields (PRODUCT_LOGIC §2.1) */
+    if (cfg.wifi_ssid[0] == '\0' || cfg.backend_host[0] == '\0' ||
+        cfg.backend_port == 0 || cfg.gateway_token[0] == '\0') {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_send(req, ERR_HTML, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
 
     esp_err_t err = app_config_save(&cfg);
     if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "save failed");
-        return ESP_FAIL;
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_send(req, ERR_HTML, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "config saved: ssid=%s host=%s:%u",
-             cfg.wifi_ssid, cfg.backend_host, cfg.backend_port);
+    /* Never log the token or Wi-Fi password. */
+    ESP_LOGI(TAG, "config saved: ssid_len=%u host=%s:%u token=%s",
+             (unsigned)strlen(cfg.wifi_ssid), cfg.backend_host, cfg.backend_port,
+             cfg.gateway_token[0] ? "set" : "empty");
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_send(req, DONE_HTML, HTTPD_RESP_USE_STRLEN);
 
-    /* reboot shortly after the response goes out */
     vTaskDelay(pdMS_TO_TICKS(800));
     esp_restart();
     return ESP_OK;
@@ -307,19 +331,32 @@ static void start_httpd(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* public API                                                          */
+/* ------------------------------------------------------------------ */
+
+static void gen_ap_password(char *out, size_t len)
+{
+    /* 8 chars from unambiguous alphabet; not derived from MAC */
+    static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    if (len < 9) return;
+    for (size_t i = 0; i < 8; i++) {
+        out[i] = alphabet[esp_random() % (sizeof(alphabet) - 1)];
+    }
+    out[8] = '\0';
+}
 
 void provisioning_start(void)
 {
-    if (s_active) {
-        return;
-    }
+    if (s_active) return;
     s_active = true;
 
-    /* AP SSID derived from MAC: HerdrPanel-XXXX */
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     snprintf(s_ap_ssid, sizeof(s_ap_ssid), "HerdrPanel-%02X%02X", mac[4], mac[5]);
-    ESP_LOGI(TAG, "starting provisioning AP \"%s\"", s_ap_ssid);
+    gen_ap_password(s_ap_pass, sizeof(s_ap_pass));
+
+    /* Do not log the temporary password. */
+    ESP_LOGI(TAG, "starting WPA2 provisioning AP \"%s\"", s_ap_ssid);
 
     esp_netif_create_default_wifi_ap();
 
@@ -331,13 +368,28 @@ void provisioning_start(void)
     snprintf((char *)ap.ap.ssid, sizeof(ap.ap.ssid), "%s", s_ap_ssid);
     ap.ap.ssid_len = strlen(s_ap_ssid);
     ap.ap.channel = AP_CHANNEL;
-    ap.ap.authmode = WIFI_AUTH_OPEN;
+    ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
     ap.ap.max_connection = 4;
+    snprintf((char *)ap.ap.password, sizeof(ap.ap.password), "%s", s_ap_pass);
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     xTaskCreatePinnedToCore(dns_task, "prov_dns", 4 * 1024, NULL, 5, &s_dns_task, 0);
     start_httpd();
+}
+
+void provisioning_stop(void)
+{
+    if (!s_active) return;
+    s_active = false;
+
+    if (s_httpd) {
+        httpd_stop(s_httpd);
+        s_httpd = NULL;
+    }
+    /* wipe temporary password */
+    memset(s_ap_pass, 0, sizeof(s_ap_pass));
+    ESP_LOGI(TAG, "provisioning stopped, AP credentials wiped");
 }
 
 bool provisioning_active(void)
@@ -350,9 +402,14 @@ void provisioning_get_ap_ssid(char *buf, int buflen)
     snprintf(buf, buflen, "%s", s_ap_ssid);
 }
 
+void provisioning_get_ap_pass(char *buf, int buflen)
+{
+    snprintf(buf, buflen, "%s", s_ap_pass);
+}
+
 void provisioning_get_qr_payload(char *buf, int buflen)
 {
-    /* WiFi join payload: scanned phones connect to the AP automatically,
-     * then the captive portal pops the config page. */
-    snprintf(buf, buflen, "WIFI:T:nopass;S:%s;;", s_ap_ssid);
+    /* Standard Wi-Fi join payload. WPA2 with the temporary AP password.
+     * Never encodes home Wi-Fi credentials or the gateway token. */
+    snprintf(buf, buflen, "WIFI:T:WPA;S:%s;P:%s;;", s_ap_ssid, s_ap_pass);
 }

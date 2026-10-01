@@ -13,7 +13,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
-#include "nvs_flash.h"
 #include "sdkconfig.h"
 
 #include "app_config.h"
@@ -56,13 +55,8 @@ void wifi_connect_start(void)
 {
     s_wifi_events = xEventGroupCreate();
 
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
-    app_config_init();
+    /* NVS + config are owned by app_config_init() called from app_main
+     * before this function. wifi_connect must not re-init NVS. */
 
     /* both paths (provisioning AP and normal STA) need the TCP/IP stack
      * and the default event loop — must exist before any netif is created */

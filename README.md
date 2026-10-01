@@ -1,37 +1,54 @@
 # Herdr ESP32 决策面板
 
-一台通过 Wi-Fi 连接 Herdr 主机的小屏终端：首次用二维码配网，平时以四宫格查看 agent 状态，进入详情查看请求，再明确地允许、拒绝或继续。固件使用 ESP-IDF。
+一台通过 Wi-Fi 连接 Herdr 主机 panel 网关的小屏终端：首次用 WPA2 热点 + 二维码配网，平时以四宫格查看 agent 状态，进入详情查看待处理请求，再明确地允许、拒绝或继续。固件使用 ESP-IDF。
 
-## 先读设计文档
+## 设计文档
 
-1. [产品与程序逻辑](docs/PRODUCT_LOGIC.md)：状态语义、完整用户路径、不同 agent 的操作边界与 HTTP 网关契约。
-2. [系统架构](docs/ARCHITECTURE.md)：现有代码问题、主机/设备模块边界、任务与消息流、内存预算及迁移顺序。
-3. [UI 设计](docs/UI_DESIGN.md)：480×480 四宫格/详情/确认/配网/设置的布局、文案、手势与动画。
-4. [开发顺序与验收](docs/ACCEPTANCE.md)：按阶段实施、测试样本、真机用例，以及当前代码与目标的差距。
+实现前请先读：
 
-**当前代码是早期原型，尚未实现上述决策网关和安全的审批动作。** 旧版的三个按钮直接向 pane 输入字面量 `allow`、`deny`、`continue` 并回车，不能可靠处理 Claude Code、OpenCode 或 Pi 的交互提示。没有网关语义适配器前，请只把它当实验 UI，不把审批按钮作为可用产品功能。
+1. [产品与程序逻辑](docs/PRODUCT_LOGIC.md)：状态语义、用户路径、动作状态机、`/api/v1/panel` 契约。
+2. [系统架构](docs/ARCHITECTURE.md)：主机/设备模块边界、任务与消息流、内存预算、实施切片。
+3. [UI 设计](docs/UI_DESIGN.md)：480×480 四宫格/详情/确认/配网/设置的布局、文案、手势。
+4. [开发顺序与验收](docs/ACCEPTANCE.md)：分阶段交付、接口样本、真机用例。
 
-## 硬件与参考材料
+**固件不向终端发字面量 `allow`/`deny`/`continue`。** 语义动作经主机 panel 网关解析后映射到各 CLI 的真实按键。没有网关适配器时按钮禁用并提示“需要在主机处理”。
 
-当前代码面向 [Waveshare ESP32-C6-Touch-AMOLED-2.16](https://docs.waveshare.com/ESP32-C6-Touch-AMOLED-2.16)，480×480 触摸 AMOLED。需求中“2.13 寸 OLED”与此不一致；实际板卡需要确认后再固定 UI 尺寸。厂商资料中的 CO5300/CST9220 与仓库驱动注释中的 SH8601/CST9217 也需实机核对。
+## 硬件
 
-仓库目前**没有** `refer/` 目录。当前可读的 REST 参考实现位于相邻目录 `/Users/calico/code/herdr-restful`，它提供 Herdr socket 的 FastAPI 包装层和验证用网页示例；该目录不属于本仓库。实现时按实际版本核对接口，产品文档中把现有接口与拟新增的 `/api/v1/panel` 接口分开列出。Herdr 官方语义参考 [Agents](https://herdr.dev/docs/agents/) 与 [Agent automation](https://herdr.dev/docs/agent-automation/)。
+面向 [Waveshare ESP32-C6-Touch-AMOLED-2.16](https://docs.waveshare.com/ESP32-C6-Touch-AMOLED-2.16)，480×480 触摸 AMOLED。厂商资料中的 CO5300/CST9220 与驱动注释中的 SH8601/CST9217 需实机核对。
 
-## 当前工程结构
+## 工程结构
 
 ```text
-main/                 ESP-IDF 应用、Wi-Fi/SoftAP 配网、HTTP 客户端、LVGL 原型
-components/           板级显示/触摸/电源与 LVGL 适配
-docs/                 目标规格与验收清单
-sdkconfig.defaults    ESP32-C6 与 LVGL 默认构建配置
-partitions.csv        16 MB Flash 分区
+main/
+  app_main.cpp           启动与生命周期
+  app_config.c/h         NVS 唯一属主；Wi-Fi + 网关地址 + 设备令牌
+  wifi_connect.c/h       STA 连接与自动重连
+  provisioning.c/h       WPA2 SoftAP + 配网页（含网关令牌字段）
+  panel_model.h          有界数据结构与三层状态
+  panel_store.c/h        快照 store + 有界队列（action_q/control_q/ui_evt_q）
+  panel_api_client.c/h   唯一 HTTP 客户端，对接 /api/v1/panel
+  panel_worker.c/h       请求调度、轮询、动作状态机
+  ui_panel.c/h           LVGL 页面（HOM/DET/CNF/RST/SET/PRV）
+  ui_common.h            色板与字体
+components/              板级显示/触摸/电源与 LVGL 适配
+refer/herdr-restful/     主机 REST + panel 网关参考实现
+docs/                    目标规格与验收清单
 ```
 
-现有配网页提供手动「扫描」按钮，扫描结果可点选以填写 Wi-Fi SSID；目标配网流程见产品逻辑文档。
+## 主机 panel 网关
 
-## 编译原型
+设备对接的是网关契约，不是原始 Herdr REST：
 
-工程清单要求 ESP-IDF ≥ 5.0；当前项目维护环境为 ESP-IDF 6.1。构建命令：
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/v1/panel/overview` | 最多 24 条 agent 卡 + `total_count` |
+| GET | `/api/v1/panel/agents/{terminal_id}` | 详情 + pending 卡 + `context_token` |
+| POST | `/api/v1/panel/agents/{terminal_id}/actions` | 语义动作，`request_id` 去重 |
+
+实现位于 `refer/herdr-restful/backend/app/panel/`。鉴权使用设备专属 Bearer 令牌；动作路径含现场复验、终端锁、at-most-once 去重。
+
+## 编译
 
 ```bash
 idf.py set-target esp32c6
@@ -39,4 +56,24 @@ idf.py build
 idf.py -p PORT flash monitor
 ```
 
-首次配网时设备应进入 SoftAP，并显示 Wi-Fi 二维码；手机连接后可访问 `http://192.168.4.1`。现有固件仍需按 [验收清单](docs/ACCEPTANCE.md) 改造与真机验证，编译成功不表示目标产品已完成。
+要求 ESP-IDF ≥ 5.x（维护环境 6.1），LVGL 9.x。
+
+## 配网
+
+1. 首次开机或选择“重新配网”后进入 WPA2 SoftAP `HerdrPanel-XXXX`。
+2. 屏幕显示热点 SSID、临时密码与 Wi-Fi 入网二维码（二维码只含热点凭据）。
+3. 手机连接热点后打开 `http://192.168.4.1`，填写家用 Wi-Fi、网关地址/端口和**设备网关令牌**。
+4. 保存后设备重启并尝试连接；保存成功不等于连通，屏幕会区分状态。
+
+网关令牌需先在主机侧生成。Wi-Fi 密码与令牌不会显示在屏幕上，也不会出现在日志中。
+
+## 阶段说明
+
+按 [ACCEPTANCE.md](docs/ACCEPTANCE.md)，当前仓库完成的是：
+
+- **A 硬件与文字骨架**：BSP 沿用，中文需补 CJK 字体资产（见 `ui_common.h`）。
+- **B 只读面板**：四宫格、详情、连接状态、0/1/4/5/24/25 会话布局。
+- **C 网关决策（主机侧）**：`/api/v1/panel` + 适配器 + 上下文令牌 + 去重。
+- **D 设备动作**：确认页、发送/回读状态机、结果未知不自动重试。
+
+E（动画/亮度/真机压力）与真实 CLI 适配器样本需在真机与实机主机上继续验收。**编译通过不等于产品完成。**

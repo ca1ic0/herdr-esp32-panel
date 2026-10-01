@@ -1,19 +1,20 @@
 /*
- * LVGL UI for the Herdr panel.
+ * LVGL UI — Herdr decision panel (UI_DESIGN.md v1).
  *
- * Home      : full-screen 2x2 grid of herdr sessions, swipe to page,
- *             one small settings gear in the bottom bar.
- * Detail    : session content + three action buttons  ✓ / ✗ / →
- * Settings  : WiFi / Backend / Reset-Network entries
- * Forms     : LVGL keyboard driven text input, save to NVS + reboot
- * Provision : QR code screen for first-time setup
+ * HOM  4-grid overview, swipe pages
+ * DET  session detail + pending card + action buttons (gateway choices only)
+ * CNF  full-screen confirm before any semantic action
+ * RST  sending / delivered / uncertain result
+ * SET  connection, display, about, re-provision (view + simple toggles)
+ * PRV  WPA2 provisioning QR
+ *
+ * Selection is (terminal_id, selection_epoch). Late network responses with
+ * a mismatched epoch are discarded in panel_worker before reaching here.
  */
 
 #include "ui_panel.h"
 
-#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "esp_system.h"
@@ -23,744 +24,934 @@
 #include "sdkconfig.h"
 
 #include "app_config.h"
-#include "herdr_model.h"
-#include "panel_state.h"
+#include "panel_model.h"
+#include "panel_store.h"
 #include "ui_common.h"
 
-#define SCREEN_W        480
-#define SCREEN_H        480
+#define SCREEN_W     480
+#define SCREEN_H     480
 
-#define GRID_X0         8
-#define GRID_X1         244
-#define GRID_Y0         6
-#define GRID_Y1         227
-#define CELL_W          228
-#define CELL_H          213
-#define BAR_Y           440        /* slim bottom bar: dots + gear */
+/* UI_DESIGN.md §4.1 card slots */
+static const struct { int x, y, w, h; } CARD_POS[4] = {
+    { 16,  76, 218, 160 },
+    { 246, 76, 218, 160 },
+    { 16,  248, 218, 160 },
+    { 246, 248, 218, 160 },
+};
 
-#define MAX_DOTS        8
+#define PAGE_SIZE    4
 
 typedef enum {
     SCR_HOME = 0,
     SCR_DETAIL,
+    SCR_CONFIRM,
+    SCR_RESULT,
     SCR_SETTINGS,
-    SCR_WIFI_FORM,
-    SCR_BACKEND_FORM,
     SCR_PROVISION,
 } screen_t;
 
 typedef struct {
     lv_obj_t *card;
-    lv_obj_t *dot;
-    lv_obj_t *title;
+    lv_obj_t *shape;      /* status circle */
+    lv_obj_t *shape_lbl;  /* ! / ? / check inside shape */
+    lv_obj_t *name;
     lv_obj_t *status;
-    lv_obj_t *cwd;
-    lv_obj_t *state;
+    lv_obj_t *project;
     lv_obj_t *pane;
-} cell_widgets_t;
+    char terminal_id[PANEL_TERM_ID_LEN];
+} cell_t;
 
-/* --- widget handles ---------------------------------------------------- */
+/* ---- widget handles --------------------------------------------------- */
 
-static lv_obj_t *s_home, *s_detail, *s_settings, *s_wifi_form, *s_backend_form,
-                *s_provision;
+static lv_obj_t *s_home, *s_detail, *s_confirm, *s_result, *s_settings, *s_prov;
 
-static lv_obj_t *s_page_dots[MAX_DOTS];
-static lv_obj_t *s_conn_label;
+static lv_obj_t *s_conn_badge, *s_pending_count, *s_page_label, *s_total_label;
 static lv_obj_t *s_empty_label;
-static cell_widgets_t s_cells[4];
+static cell_t s_cells[4];
 
-static lv_obj_t *s_det_title, *s_det_status, *s_det_cwd, *s_det_pane,
-                *s_det_output, *s_det_toast;
+static lv_obj_t *s_det_name, *s_det_status, *s_det_project, *s_det_updated;
+static lv_obj_t *s_det_content;
+static lv_obj_t *s_btn_allow, *s_btn_deny, *s_btn_continue, *s_btn_host;
+static lv_obj_t *s_det_hint;
 
-static lv_obj_t *s_set_wifi_sub, *s_set_backend_sub;
+static lv_obj_t *s_cnf_title, *s_cnf_body, *s_cnf_hint;
+static lv_obj_t *s_cnf_cancel, *s_cnf_ok;
 
-static lv_obj_t *s_ta_ssid, *s_ta_pass, *s_kb_wifi;
-static lv_obj_t *s_ta_host, *s_ta_port, *s_kb_backend;
+static lv_obj_t *s_rst_title, *s_rst_body, *s_rst_back;
+
+static lv_obj_t *s_set_conn, *s_set_display, *s_set_about;
 
 static lv_obj_t *s_prov_qr, *s_prov_info;
 
-/* --- local model -------------------------------------------------------- */
+/* ---- local view state -------------------------------------------------- */
 
-static herdr_session_t s_sessions[HERDR_MAX_SESSIONS];
-static int s_count = 0;
-static int s_page = 0;
-static int s_selected = -1;
+static panel_agent_card_t s_cards[PANEL_MAX_AGENTS];
+static int s_card_count;
+static int s_page;
 static screen_t s_screen = SCR_HOME;
-static uint32_t s_last_output_fetch = 0;
 
-/* forward declarations for callbacks used while building widgets */
-static void on_card_clicked(lv_event_t *e);
-static void on_home_gesture(lv_event_t *e);
-static void on_action(lv_event_t *e);
-static void on_gear(lv_event_t *e);
-static void on_back_home(lv_event_t *e);
-static void on_back_settings(lv_event_t *e);
-static void on_open_wifi(lv_event_t *e);
-static void on_open_backend(lv_event_t *e);
-static void on_reset_network(lv_event_t *e);
-static void on_save_wifi(lv_event_t *e);
-static void on_save_backend(lv_event_t *e);
-static void on_ta_focus(lv_event_t *e);
+/* selection */
+static char s_sel_term[PANEL_TERM_ID_LEN];
+static uint32_t s_sel_epoch;
+static panel_action_id_t s_pending_action;
+static panel_pending_t s_frozen_pending;
 
-/* --- small helpers ------------------------------------------------------ */
+/* display prefs (UI-local) */
+static int s_brightness = 45;
+static bool s_reduce_motion;
 
-static void restart_task(void *arg)
+/* provisioning copy */
+static char s_prov_ssid[24];
+static char s_prov_pass[12];
+static char s_prov_qr_text[128];
+
+static uint32_t s_seen_generation;
+
+/* ---- forward decls ----------------------------------------------------- */
+static void show_screen(screen_t s);
+static void on_card(lv_event_t *e);
+static void on_menu(lv_event_t *e);
+static void on_back(lv_event_t *e);
+static void on_action_btn(lv_event_t *e);
+static void on_confirm_cancel(lv_event_t *e);
+static void on_confirm_ok(lv_event_t *e);
+static void on_result_back(lv_event_t *e);
+static void on_refresh(lv_event_t *e);
+
+/* ---- helpers ----------------------------------------------------------- */
+
+static void bump_epoch(void)
 {
-    (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(900));
-    esp_restart();
+    s_sel_epoch++;
 }
 
-static void restart_soon(void)
+static bool selection_matches(const char *term, uint32_t epoch)
 {
-    xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL);
+    return strcmp(s_sel_term, term) == 0 && s_sel_epoch == epoch;
 }
 
-static lv_obj_t *make_button(lv_obj_t *parent, int x, int y, int w, int h,
-                             const char *txt, uint32_t bg, int font_size)
+static const char *shape_symbol(panel_agent_state_t st)
 {
-    lv_obj_t *btn = lv_button_create(parent);
-    lv_obj_set_pos(btn, x, y);
-    lv_obj_set_size(btn, w, h);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(bg), 0);
-    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(btn, 12, 0);
-    lv_obj_t *lbl = lv_label_create(btn);
-    lv_label_set_text(lbl, txt);
-    lv_obj_set_style_text_font(lbl, ui_font(font_size), 0);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(lbl);
-    return btn;
-}
-
-static lv_obj_t *make_textarea(lv_obj_t *parent, int x, int y, int w,
-                               const char *placeholder, bool password)
-{
-    lv_obj_t *ta = lv_textarea_create(parent);
-    lv_obj_set_pos(ta, x, y);
-    lv_obj_set_size(ta, w, 44);
-    lv_textarea_set_one_line(ta, true);
-    lv_textarea_set_password_mode(ta, password);
-    lv_textarea_set_max_length(ta, 64);
-    lv_textarea_set_placeholder_text(ta, placeholder);
-    lv_obj_set_style_text_font(ta, ui_font(16), 0);
-    return ta;
-}
-
-/* --- home grid ---------------------------------------------------------- */
-
-static void build_cells(void)
-{
-    static const int col_x[2] = { GRID_X0, GRID_X1 };
-    static const int row_y[2] = { GRID_Y0, GRID_Y1 };
-
-    for (int i = 0; i < 4; i++) {
-        cell_widgets_t *c = &s_cells[i];
-
-        c->card = lv_obj_create(s_home);
-        lv_obj_set_pos(c->card, col_x[i % 2], row_y[i / 2]);
-        lv_obj_set_size(c->card, CELL_W, CELL_H);
-        lv_obj_set_style_bg_color(c->card, lv_color_hex(COLOR_PANEL), 0);
-        lv_obj_set_style_bg_opa(c->card, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_color(c->card, lv_color_hex(COLOR_BORDER), 0);
-        lv_obj_set_style_border_width(c->card, 1, 0);
-        lv_obj_set_style_radius(c->card, 14, 0);
-        lv_obj_set_style_pad_all(c->card, 0, 0);
-        lv_obj_set_scrollable(c->card, false);
-        lv_obj_set_clickable(c->card, true);
-        lv_obj_add_event_cb(c->card, on_card_clicked, LV_EVENT_CLICKED,
-                            (void *)(intptr_t)i);
-
-        c->dot = lv_obj_create(c->card);
-        lv_obj_set_pos(c->dot, 12, 16);
-        lv_obj_set_size(c->dot, 14, 14);
-        lv_obj_set_style_radius(c->dot, 7, 0);
-        lv_obj_set_style_bg_color(c->dot, lv_color_hex(0x4a5563), 0);
-        lv_obj_set_style_bg_opa(c->dot, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(c->dot, 0, 0);
-        lv_obj_set_scrollable(c->dot, false);
-
-        c->title = ui_label(c->card, 34, 8, CELL_W - 46, "---", 16, COLOR_TEXT);
-        c->status = ui_label(c->card, 12, 42, CELL_W - 24, "UNKNOWN", 14, 0x4a5563);
-        c->cwd = ui_label(c->card, 12, 72, CELL_W - 24, "", 12, COLOR_DIM);
-        c->state = ui_label(c->card, 12, 100, CELL_W - 24, "", 12, COLOR_ACCENT);
-        c->pane = ui_label(c->card, 12, CELL_H - 30, CELL_W - 24, "", 12, COLOR_DIM);
+    switch (st) {
+    case PANEL_AGENT_BLOCKED: return LV_SYMBOL_WARNING;
+    case PANEL_AGENT_WORKING: return LV_SYMBOL_REFRESH;
+    case PANEL_AGENT_DONE:    return LV_SYMBOL_OK;
+    case PANEL_AGENT_IDLE:    return LV_SYMBOL_MINUS;
+    default:                  return "?";
     }
 }
 
-static void fill_cell(int slot, const herdr_session_t *s)
+static void style_card_base(lv_obj_t *card, bool blocked, bool selected)
 {
-    cell_widgets_t *c = &s_cells[slot];
-    uint32_t color = herdr_status_color(s->status);
-
-    lv_obj_set_hidden(c->card, false);
-    lv_obj_set_style_border_color(c->card,
-                                  lv_color_hex(s->focused ? COLOR_ACCENT : COLOR_BORDER), 0);
-    lv_obj_set_style_border_width(c->card, s->focused ? 2 : 1, 0);
-
-    lv_obj_set_style_bg_color(c->dot, lv_color_hex(color), 0);
-    lv_label_set_text(c->title, s->title);
-    lv_label_set_text(c->status, herdr_status_name(s->status));
-    lv_obj_set_style_text_color(c->status, lv_color_hex(color), 0);
-
-    lv_label_set_text(c->cwd, s->cwd);
-    lv_label_set_text(c->state, s->state);
-    lv_label_set_text(c->pane, s->pane_id);
-}
-
-static void refresh_dots(int pages)
-{
-    for (int i = 0; i < MAX_DOTS; i++) {
-        if (s_page_dots[i] == NULL) {
-            continue;
-        }
-        if (i >= pages) {
-            lv_obj_set_hidden(s_page_dots[i], true);
-            continue;
-        }
-        lv_obj_set_hidden(s_page_dots[i], false);
-        lv_obj_set_style_bg_color(s_page_dots[i],
-                                  lv_color_hex(i == s_page ? COLOR_ACCENT : COLOR_BORDER), 0);
+    uint32_t border = COLOR_BORDER;
+    int width = 1;
+    if (blocked) {
+        border = COLOR_PENDING;
+        width = 2;
+    } else if (selected) {
+        border = COLOR_ACCENT;
+        width = 2;
     }
+    lv_obj_set_style_border_color(card, lv_color_hex(border), 0);
+    lv_obj_set_style_border_width(card, width, 0);
 }
 
-static void refresh_grid(void)
-{
-    int pages = (s_count + 3) / 4;
-    if (pages < 1) {
-        pages = 1;
-    }
-    if (s_page >= pages) {
-        s_page = pages - 1;
-    }
-    if (s_page < 0) {
-        s_page = 0;
-    }
-
-    for (int slot = 0; slot < 4; slot++) {
-        int idx = s_page * 4 + slot;
-        if (idx < s_count) {
-            fill_cell(slot, &s_sessions[idx]);
-        } else {
-            lv_obj_set_hidden(s_cells[slot].card, true);
-        }
-    }
-
-    lv_obj_set_hidden(s_empty_label, s_count != 0);
-    refresh_dots(pages);
-}
-
-/* --- navigation --------------------------------------------------------- */
-
-static void goto_detail(int idx)
-{
-    if (idx < 0 || idx >= s_count) {
-        return;
-    }
-    s_selected = idx;
-    s_screen = SCR_DETAIL;
-
-    const herdr_session_t *s = &s_sessions[idx];
-    lv_label_set_text(s_det_title, s->title);
-    lv_label_set_text(s_det_status, herdr_status_name(s->status));
-    lv_obj_set_style_text_color(s_det_status,
-                                lv_color_hex(herdr_status_color(s->status)), 0);
-    lv_label_set_text(s_det_cwd, s->cwd);
-    lv_label_set_text(s_det_pane, s->pane_id);
-    lv_label_set_text(s_det_output, "(loading output...)");
-    lv_label_set_text(s_det_toast, "");
-
-    panel_set_detail_pane(s->pane_id);
-    panel_fetch_output(s->pane_id);
-    s_last_output_fetch = lv_tick_get();
-
-    lv_screen_load(s_detail);
-}
-
-static void goto_home(void)
-{
-    s_screen = SCR_HOME;
-    s_selected = -1;
-    panel_set_detail_pane("");
-    lv_screen_load(s_home);
-    refresh_grid();
-}
-
-static void goto_screen(lv_obj_t *scr, screen_t id)
-{
-    s_screen = id;
-    lv_screen_load(scr);
-}
-
-static void on_card_clicked(lv_event_t *e)
-{
-    intptr_t slot = (intptr_t)lv_event_get_user_data(e);
-    goto_detail(s_page * 4 + (int)slot);
-}
-
-static void on_home_gesture(lv_event_t *e)
-{
-    lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
-    if (dir == LV_DIR_LEFT && (s_page + 1) * 4 < s_count) {
-        s_page++;
-        refresh_grid();
-    } else if (dir == LV_DIR_RIGHT && s_page > 0) {
-        s_page--;
-        refresh_grid();
-    }
-    (void)e;
-}
-
-static void on_back_home(lv_event_t *e)
-{
-    (void)e;
-    goto_home();
-}
-
-static void on_gear(lv_event_t *e)
-{
-    (void)e;
-    /* refresh the settings summary lines */
-    app_config_t cfg;
-    app_config_get(&cfg);
-    lv_label_set_text(s_set_wifi_sub, cfg.wifi_ssid);
-    lv_label_set_text(s_set_backend_sub, cfg.backend_host);
-    goto_screen(s_settings, SCR_SETTINGS);
-}
-
-static void on_back_settings(lv_event_t *e)
-{
-    (void)e;
-    if (s_screen == SCR_WIFI_FORM || s_screen == SCR_BACKEND_FORM) {
-        goto_screen(s_settings, SCR_SETTINGS);
-    } else {
-        goto_home();
-    }
-}
-
-static void on_action(lv_event_t *e)
-{
-    if (s_selected < 0 || s_selected >= s_count) {
-        return;
-    }
-    const char *payload = (const char *)lv_event_get_user_data(e);
-    const herdr_session_t *s = &s_sessions[s_selected];
-
-    if (panel_send_text(s->pane_id, payload)) {
-        lv_label_set_text_fmt(s_det_toast, "sent: %s", payload);
-    } else {
-        lv_label_set_text(s_det_toast, "queue full, try again");
-    }
-    panel_fetch_output(s->pane_id);
-    s_last_output_fetch = lv_tick_get();
-}
-
-/* --- settings forms ------------------------------------------------------ */
-
-static void on_open_wifi(lv_event_t *e)
-{
-    (void)e;
-    app_config_t cfg;
-    app_config_get(&cfg);
-    lv_textarea_set_text(s_ta_ssid, cfg.wifi_ssid);
-    lv_textarea_set_text(s_ta_pass, cfg.wifi_pass);
-    lv_keyboard_set_textarea(s_kb_wifi, s_ta_ssid);
-    goto_screen(s_wifi_form, SCR_WIFI_FORM);
-}
-
-static void on_open_backend(lv_event_t *e)
-{
-    (void)e;
-    app_config_t cfg;
-    app_config_get(&cfg);
-    lv_textarea_set_text(s_ta_host, cfg.backend_host);
-    char port[8];
-    snprintf(port, sizeof(port), "%u", (unsigned)cfg.backend_port);
-    lv_textarea_set_text(s_ta_port, port);
-    lv_keyboard_set_textarea(s_kb_backend, s_ta_host);
-    goto_screen(s_backend_form, SCR_BACKEND_FORM);
-}
-
-static void on_reset_network(lv_event_t *e)
-{
-    (void)e;
-    app_config_t cfg;
-    app_config_get(&cfg);
-    cfg.wifi_ssid[0] = '\0';
-    cfg.wifi_pass[0] = '\0';
-    app_config_save(&cfg);
-    restart_soon();
-}
-
-static void on_save_wifi(lv_event_t *e)
-{
-    (void)e;
-    app_config_t cfg;
-    app_config_get(&cfg);
-    snprintf(cfg.wifi_ssid, sizeof(cfg.wifi_ssid), "%s",
-             lv_textarea_get_text(s_ta_ssid));
-    snprintf(cfg.wifi_pass, sizeof(cfg.wifi_pass), "%s",
-             lv_textarea_get_text(s_ta_pass));
-    app_config_save(&cfg);
-    restart_soon();
-}
-
-static void on_save_backend(lv_event_t *e)
-{
-    (void)e;
-    app_config_t cfg;
-    app_config_get(&cfg);
-    snprintf(cfg.backend_host, sizeof(cfg.backend_host), "%s",
-             lv_textarea_get_text(s_ta_host));
-    int port = atoi(lv_textarea_get_text(s_ta_port));
-    if (port > 0 && port < 65536) {
-        cfg.backend_port = (uint16_t)port;
-    }
-    app_config_save(&cfg);
-    restart_soon();
-}
-
-static void on_ta_focus(lv_event_t *e)
-{
-    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
-    lv_keyboard_set_textarea(
-        (s_screen == SCR_WIFI_FORM) ? s_kb_wifi : s_kb_backend, ta);
-}
-
-/* --- screen construction -------------------------------------------------- */
-
-static lv_obj_t *new_screen(void)
+static lv_obj_t *make_screen(void)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_hex(COLOR_BG), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    lv_obj_set_scrollable(scr, false);
-    /* the default theme pads lv_obj by ~20px; children use absolute
-     * coordinates, so padding must be zeroed or they overflow the screen */
     lv_obj_set_style_pad_all(scr, 0, 0);
-    lv_obj_set_style_pad_row(scr, 0, 0);
-    lv_obj_set_style_pad_column(scr, 0, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     return scr;
 }
 
-static lv_obj_t *make_back_button(lv_obj_t *parent, lv_event_cb_t cb)
-{
-    lv_obj_t *btn = lv_button_create(parent);
-    lv_obj_set_pos(btn, 8, 8);
-    lv_obj_set_size(btn, 72, 40);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(COLOR_PANEL), 0);
-    lv_obj_set_style_radius(btn, 10, 0);
-    lv_obj_t *lbl = lv_label_create(btn);
-    lv_label_set_text(lbl, LV_SYMBOL_LEFT " back");
-    lv_obj_set_style_text_font(lbl, ui_font(14), 0);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), 0);
-    lv_obj_center(lbl);
-    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
-    return btn;
-}
+/* ====================================================================== */
+/* HOM                                                                     */
+/* ====================================================================== */
 
 static void build_home(void)
 {
-    s_home = new_screen();
-    lv_obj_add_event_cb(s_home, on_home_gesture, LV_EVENT_GESTURE, NULL);
+    s_home = make_screen();
 
-    build_cells();
+    /* top bar: HERDR | blocked N | menu */
+    ui_label(s_home, 16, 20, 100, "HERDR", 24, COLOR_TEXT);
 
-    s_empty_label = ui_label(s_home, 0, 200, SCREEN_W,
-                             "no active herdr sessions", 16, COLOR_DIM);
+    s_conn_badge = ui_label(s_home, 120, 28, 140, "", 18, COLOR_UNKNOWN);
+
+    s_pending_count = ui_label(s_home, 260, 24, 140, "Blocked 0", 20, COLOR_PENDING);
+    lv_obj_add_flag(s_pending_count, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_pending_count, on_refresh, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *menu = ui_button(s_home, 400, 12, 64, 48, LV_SYMBOL_SETTINGS, COLOR_CARD, 20);
+    lv_obj_add_event_cb(menu, on_menu, LV_EVENT_CLICKED, NULL);
+
+    /* 4 cards */
+    for (int i = 0; i < 4; i++) {
+        cell_t *c = &s_cells[i];
+        c->card = lv_obj_create(s_home);
+        lv_obj_set_pos(c->card, CARD_POS[i].x, CARD_POS[i].y);
+        lv_obj_set_size(c->card, CARD_POS[i].w, CARD_POS[i].h);
+        lv_obj_set_style_bg_color(c->card, lv_color_hex(COLOR_CARD), 0);
+        lv_obj_set_style_bg_opa(c->card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(c->card, 14, 0);
+        lv_obj_set_style_pad_all(c->card, 0, 0);
+        lv_obj_clear_flag(c->card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(c->card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(c->card, on_card, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        c->shape = lv_obj_create(c->card);
+        lv_obj_set_pos(c->shape, 12, 14);
+        lv_obj_set_size(c->shape, 28, 28);
+        lv_obj_set_style_radius(c->shape, 14, 0);
+        lv_obj_set_style_bg_opa(c->shape, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(c->shape, 0, 0);
+        lv_obj_clear_flag(c->shape, LV_OBJ_FLAG_SCROLLABLE);
+
+        c->shape_lbl = lv_label_create(c->shape);
+        lv_label_set_text(c->shape_lbl, "");
+        lv_obj_set_style_text_font(c->shape_lbl, ui_font(14), 0);
+        lv_obj_set_style_text_color(c->shape_lbl, lv_color_hex(COLOR_BG), 0);
+        lv_obj_center(c->shape_lbl);
+
+        c->name = ui_label(c->card, 48, 12, CARD_POS[i].w - 60, "---", 20, COLOR_TEXT);
+        c->status = ui_label(c->card, 12, 52, CARD_POS[i].w - 24, "", 24, COLOR_UNKNOWN);
+        c->project = ui_label(c->card, 12, 92, CARD_POS[i].w - 24, "", 18, COLOR_DIM);
+        c->pane = ui_label(c->card, 12, CARD_POS[i].h - 28, CARD_POS[i].w - 24, "", 12, COLOR_DISABLED);
+    }
+
+    /* empty state (0 sessions) */
+    s_empty_label = ui_label(s_home, 40, 200, 400, "No active agents", 24, COLOR_DIM);
     lv_obj_set_style_text_align(s_empty_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* slim bottom bar: page dots (center) + settings gear (right) */
-    lv_obj_t *bar = lv_obj_create(s_home);
-    lv_obj_set_pos(bar, 0, BAR_Y);
-    lv_obj_set_size(bar, SCREEN_W, SCREEN_H - BAR_Y);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(COLOR_ELEVATED), 0);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(bar, 0, 0);
-    lv_obj_set_style_radius(bar, 0, 0);
-    lv_obj_set_scrollable(bar, false);
-    lv_obj_set_style_pad_all(bar, 0, 0);
+    /* bottom bar */
+    s_page_label = ui_label(s_home, 16, 436, 120, "Page 1/1", 18, COLOR_DIM);
+    s_total_label = ui_label(s_home, 160, 436, 160, "Total 0", 18, COLOR_DIM);
 
-    s_conn_label = ui_label(bar, 12, 12, 200, "", 12, COLOR_DIM);
-
-    int dot_total_w = MAX_DOTS * 18;
-    for (int i = 0; i < MAX_DOTS; i++) {
-        lv_obj_t *d = lv_obj_create(bar);
-        lv_obj_set_pos(d, (SCREEN_W - dot_total_w) / 2 + i * 18, 16);
-        lv_obj_set_size(d, 10, 10);
-        lv_obj_set_style_radius(d, 5, 0);
-        lv_obj_set_style_bg_color(d, lv_color_hex(COLOR_BORDER), 0);
-        lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(d, 0, 0);
-        lv_obj_set_scrollable(d, false);
-        s_page_dots[i] = d;
-    }
-
-    lv_obj_t *gear = lv_button_create(bar);
-    lv_obj_set_pos(gear, SCREEN_W - 60, 4);
-    lv_obj_set_size(gear, 52, 32);
-    lv_obj_set_style_bg_color(gear, lv_color_hex(COLOR_PANEL), 0);
-    lv_obj_set_style_radius(gear, 10, 0);
-    lv_obj_t *lbl = lv_label_create(gear);
-    lv_label_set_text(lbl, LV_SYMBOL_SETTINGS);
-    lv_obj_set_style_text_font(lbl, ui_font(20), 0);
-    lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), 0);
-    lv_obj_center(lbl);
-    lv_obj_add_event_cb(gear, on_gear, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *prev = ui_button(s_home, 340, 428, 52, 40, LV_SYMBOL_LEFT, COLOR_CARD, 18);
+    lv_obj_t *next = ui_button(s_home, 404, 428, 52, 40, LV_SYMBOL_RIGHT, COLOR_CARD, 18);
+    lv_obj_add_event_cb(prev, on_back, LV_EVENT_CLICKED, (void *)(intptr_t)100);
+    lv_obj_add_event_cb(next, on_back, LV_EVENT_CLICKED, (void *)(intptr_t)101);
 }
 
-static void build_detail(void)
+static void fill_cell(int slot, const panel_agent_card_t *a)
 {
-    s_detail = new_screen();
-
-    make_back_button(s_detail, on_back_home);
-    s_det_title = ui_label(s_detail, 88, 12, 280, "---", 16, COLOR_TEXT);
-    s_det_status = ui_label(s_detail, 370, 14, 98, "UNKNOWN", 12, COLOR_DIM);
-    lv_obj_set_style_text_align(s_det_status, LV_TEXT_ALIGN_RIGHT, 0);
-    s_det_cwd = ui_label(s_detail, 12, 52, 456, "", 12, COLOR_DIM);
-    s_det_pane = ui_label(s_detail, 12, 74, 456, "", 12, COLOR_DIM);
-
-    lv_obj_t *box = lv_obj_create(s_detail);
-    lv_obj_set_pos(box, 12, 100);
-    lv_obj_set_size(box, 456, 230);
-    lv_obj_set_style_bg_color(box, lv_color_hex(COLOR_PANEL), 0);
-    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(box, lv_color_hex(COLOR_BORDER), 0);
-    lv_obj_set_style_border_width(box, 1, 0);
-    lv_obj_set_style_radius(box, 12, 0);
-    lv_obj_set_style_pad_all(box, 10, 0);
-    lv_obj_set_scrollbar_mode(box, LV_SCROLLBAR_MODE_AUTO);
-
-    s_det_output = lv_label_create(box);
-    lv_obj_set_width(s_det_output, 436);
-    lv_label_set_long_mode(s_det_output, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(s_det_output, "(no output)");
-    lv_obj_set_style_text_font(s_det_output, ui_font(12), 0);
-    lv_obj_set_style_text_color(s_det_output, lv_color_hex(COLOR_TEXT), 0);
-
-    s_det_toast = ui_label(s_detail, 12, 338, 456, "", 12, COLOR_ACCENT);
-
-    /* three action buttons: ✓ allow   ✗ deny   → continue */
-    struct {
-        const char *sym;
-        const char *cap;
-        uint32_t color;
-        const char *payload;
-    } acts[3] = {
-        { LV_SYMBOL_OK,    "allow",    COLOR_GREEN, CONFIG_HERDR_ACTION_ALLOW_TEXT },
-        { LV_SYMBOL_CLOSE, "deny",     COLOR_RED,   CONFIG_HERDR_ACTION_DENY_TEXT },
-        { LV_SYMBOL_RIGHT, "continue", COLOR_ACCENT, CONFIG_HERDR_ACTION_CONTINUE_TEXT },
-    };
-    for (int i = 0; i < 3; i++) {
-        lv_obj_t *btn = lv_button_create(s_detail);
-        lv_obj_set_pos(btn, 12 + i * 156, 364);
-        lv_obj_set_size(btn, 144, 76);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(acts[i].color), 0);
-        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(btn, 14, 0);
-        lv_obj_add_event_cb(btn, on_action, LV_EVENT_CLICKED, (void *)acts[i].payload);
-
-        lv_obj_t *lbl = lv_label_create(btn);
-        lv_label_set_text_fmt(lbl, "%s\n%s", acts[i].sym, acts[i].cap);
-        lv_obj_set_style_text_font(lbl, ui_font(20), 0);
-        lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), 0);
-        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_pad_top(lbl, 2, 0);
-        lv_obj_center(lbl);
+    cell_t *c = &s_cells[slot];
+    if (a == NULL) {
+        /* empty slot: dashed look via dim border, no click */
+        lv_obj_set_style_border_color(c->card, lv_color_hex(COLOR_BORDER), 0);
+        lv_obj_set_style_border_width(c->card, 1, 0);
+        lv_obj_set_style_bg_opa(c->card, LV_OPA_30, 0);
+        lv_label_set_text(c->name, "");
+        lv_label_set_text(c->status, "Empty");
+        lv_label_set_text(c->project, "");
+        lv_label_set_text(c->pane, "");
+        lv_obj_set_style_bg_color(c->shape, lv_color_hex(COLOR_BORDER), 0);
+        lv_label_set_text(c->shape_lbl, "");
+        c->terminal_id[0] = '\0';
+        return;
     }
+
+    lv_obj_set_style_bg_opa(c->card, LV_OPA_COVER, 0);
+    bool blocked = (a->herdr_status == PANEL_AGENT_BLOCKED);
+    style_card_base(c->card, blocked, false);
+
+    uint32_t col = panel_agent_state_color(a->herdr_status);
+    lv_obj_set_style_bg_color(c->shape, lv_color_hex(col), 0);
+    /* blocked = solid; idle = hollow ring */
+    if (a->herdr_status == PANEL_AGENT_IDLE) {
+        lv_obj_set_style_bg_opa(c->shape, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_color(c->shape, lv_color_hex(col), 0);
+        lv_obj_set_style_border_width(c->shape, 3, 0);
+    } else {
+        lv_obj_set_style_bg_opa(c->shape, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(c->shape, 0, 0);
+    }
+    lv_label_set_text(c->shape_lbl, shape_symbol(a->herdr_status));
+
+    lv_label_set_text(c->name, a->display_name[0] ? a->display_name : a->agent);
+    lv_label_set_text(c->status, panel_agent_state_name(a->herdr_status));
+    lv_obj_set_style_text_color(c->status, lv_color_hex(col), 0);
+    lv_label_set_text(c->project, a->cwd_tail[0] ? a->cwd_tail : a->workspace_label);
+    lv_label_set_text(c->pane, a->pane_id);
+    snprintf(c->terminal_id, sizeof(c->terminal_id), "%s", a->terminal_id);
 }
 
-static void build_settings(void)
+static void refresh_home(const panel_overview_t *ov, panel_conn_state_t conn)
 {
-    s_settings = new_screen();
-    make_back_button(s_settings, on_back_settings);
-    ui_label(s_settings, 88, 12, 300, "Settings", 20, COLOR_TEXT);
+    lv_label_set_text(s_conn_badge, panel_conn_state_name(conn));
+    lv_obj_set_style_text_color(s_conn_badge,
+        lv_color_hex(conn == PANEL_CONN_ONLINE ? COLOR_IDLE : COLOR_PENDING), 0);
 
-    struct {
-        const char *title;
-        lv_event_cb_t cb;
-        lv_obj_t **sub;
-        const char *icon;
-    } rows[3] = {
-        { "WiFi network", on_open_wifi, &s_set_wifi_sub, LV_SYMBOL_WIFI },
-        { "Backend server", on_open_backend, &s_set_backend_sub, LV_SYMBOL_DRIVE },
-        { "Reset network", on_reset_network, NULL, LV_SYMBOL_REFRESH },
-    };
-    for (int i = 0; i < 3; i++) {
-        lv_obj_t *row = lv_button_create(s_settings);
-        lv_obj_set_pos(row, 12, 72 + i * 88);
-        lv_obj_set_size(row, 456, 76);
-        lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_PANEL), 0);
-        lv_obj_set_style_radius(row, 12, 0);
-        lv_obj_set_style_pad_all(row, 0, 0);
-        lv_obj_add_event_cb(row, rows[i].cb, LV_EVENT_CLICKED, NULL);
+    int blocked_n = 0;
+    for (int i = 0; i < ov->count; i++) {
+        if (ov->agents[i].herdr_status == PANEL_AGENT_BLOCKED) blocked_n++;
+    }
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Blocked %d", blocked_n);
+    lv_label_set_text(s_pending_count, buf);
 
-        lv_obj_t *ic = lv_label_create(row);
-        lv_label_set_text(ic, rows[i].icon);
-        lv_obj_set_style_text_font(ic, ui_font(20), 0);
-        lv_obj_set_style_text_color(ic, lv_color_hex(COLOR_ACCENT), 0);
-        lv_obj_align(ic, LV_ALIGN_LEFT_MID, 12, 0);
+    int pages = (ov->count + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (pages < 1) pages = 1;
+    if (s_page >= pages) s_page = pages - 1;
+    if (s_page < 0) s_page = 0;
 
-        lv_obj_t *t = lv_label_create(row);
-        lv_label_set_text(t, rows[i].title);
-        lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(t, 372);
-        lv_obj_set_style_text_font(t, ui_font(16), 0);
-        lv_obj_set_style_text_color(t, lv_color_hex(COLOR_TEXT), 0);
-        lv_obj_align(t, LV_ALIGN_LEFT_MID, 52, -12);
+    snprintf(buf, sizeof(buf), "Page %d/%d", s_page + 1, pages);
+    lv_label_set_text(s_page_label, buf);
+    snprintf(buf, sizeof(buf), "Total %d", ov->count);
+    lv_label_set_text(s_total_label, buf);
 
-        if (rows[i].sub != NULL) {
-            lv_obj_t *sub = lv_label_create(row);
-            lv_label_set_text(sub, "");
-            lv_label_set_long_mode(sub, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(sub, 372);
-            lv_obj_set_style_text_font(sub, ui_font(12), 0);
-            lv_obj_set_style_text_color(sub, lv_color_hex(COLOR_DIM), 0);
-            lv_obj_align(sub, LV_ALIGN_LEFT_MID, 52, 14);
-            *rows[i].sub = sub;
+    if (ov->count == 0) {
+        lv_obj_clear_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
+        for (int i = 0; i < 4; i++) {
+            lv_obj_add_flag(s_cells[i].card, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+    lv_obj_add_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
+
+    for (int i = 0; i < 4; i++) {
+        int idx = s_page * PAGE_SIZE + i;
+        lv_obj_clear_flag(s_cells[i].card, LV_OBJ_FLAG_HIDDEN);
+        if (idx < ov->count) {
+            fill_cell(i, &ov->agents[idx]);
+        } else {
+            fill_cell(i, NULL);
         }
     }
 }
 
-static lv_obj_t *build_form_common(lv_event_cb_t back_cb, const char *title)
+/* ====================================================================== */
+/* DET                                                                     */
+/* ====================================================================== */
+
+static void build_detail(void)
 {
-    lv_obj_t *scr = new_screen();
-    make_back_button(scr, back_cb);
-    ui_label(scr, 88, 12, 300, title, 20, COLOR_TEXT);
-    return scr;
+    s_detail = make_screen();
+
+    lv_obj_t *back = ui_button(s_detail, 8, 8, 56, 48, LV_SYMBOL_LEFT, COLOR_CARD, 22);
+    lv_obj_add_event_cb(back, on_back, LV_EVENT_CLICKED, (void *)(intptr_t)10);
+
+    s_det_name = ui_label(s_detail, 72, 18, 280, "", 24, COLOR_TEXT);
+
+    lv_obj_t *menu = ui_button(s_detail, 408, 8, 56, 48, "Refresh", COLOR_CARD, 18);
+    lv_obj_add_event_cb(menu, on_refresh, LV_EVENT_CLICKED, NULL);
+
+    s_det_status = ui_label(s_detail, 16, 72, 200, "", 24, COLOR_UNKNOWN);
+    s_det_project = ui_label(s_detail, 16, 104, 280, "", 18, COLOR_DIM);
+    s_det_updated = ui_label(s_detail, 300, 80, 164, "", 16, COLOR_DISABLED);
+
+    s_det_content = lv_obj_create(s_detail);
+    lv_obj_set_pos(s_det_content, 16, 140);
+    lv_obj_set_size(s_det_content, 448, 176);
+    lv_obj_set_style_bg_color(s_det_content, lv_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_bg_opa(s_det_content, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_det_content, 12, 0);
+    lv_obj_set_style_border_color(s_det_content, lv_color_hex(COLOR_BORDER), 0);
+    lv_obj_set_style_border_width(s_det_content, 1, 0);
+    lv_obj_set_style_pad_all(s_det_content, 12, 0);
+
+    /* action area: 16,332,448,88 — up to 2 buttons */
+    s_btn_allow = ui_button(s_detail, 16, 332, 220, 88, "Allow once", COLOR_DONE, 22);
+    s_btn_deny = ui_button(s_detail, 244, 332, 220, 88, "Deny", COLOR_PENDING, 22);
+    s_btn_continue = ui_button(s_detail, 16, 332, 448, 88, "Continue", COLOR_ACCENT, 22);
+    s_btn_host = ui_button(s_detail, 16, 332, 448, 88, "Use host terminal", COLOR_BORDER, 20);
+    lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_btn_allow, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_ALLOW_ONCE);
+    lv_obj_add_event_cb(s_btn_deny, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_DENY);
+    lv_obj_add_event_cb(s_btn_continue, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_CONTINUE);
+    lv_obj_add_event_cb(s_btn_host, on_refresh, LV_EVENT_CLICKED, NULL);
+
+    s_det_hint = ui_label(s_detail, 16, 432, 448, "Confirm after action", 18, COLOR_DIM);
 }
 
-static void build_wifi_form(void)
+static void render_detail(const panel_detail_t *det, panel_conn_state_t conn)
 {
-    s_wifi_form = build_form_common(on_back_settings, "WiFi setup");
+    lv_label_set_text(s_det_name, det->agent[0] ? det->agent : det->terminal_id);
 
-    ui_label(s_wifi_form, 12, 62, 200, "SSID", 12, COLOR_DIM);
-    s_ta_ssid = make_textarea(s_wifi_form, 12, 82, 456, "network name", false);
-    ui_label(s_wifi_form, 12, 136, 200, "Password", 12, COLOR_DIM);
-    s_ta_pass = make_textarea(s_wifi_form, 12, 156, 456, "network password", true);
+    uint32_t col = panel_agent_state_color(det->herdr_status);
+    lv_label_set_text(s_det_status, panel_agent_state_name(det->herdr_status));
+    lv_obj_set_style_text_color(s_det_status, lv_color_hex(col), 0);
 
-    lv_obj_t *save = make_button(s_wifi_form, 12, 212, 456, 48,
-                                 "Save & Restart", COLOR_GREEN, 16);
-    lv_obj_add_event_cb(save, on_save_wifi, LV_EVENT_CLICKED, NULL);
+    lv_label_set_text(s_det_project, det->pane_id);
 
-    s_kb_wifi = lv_keyboard_create(s_wifi_form);
-    lv_obj_set_size(s_kb_wifi, SCREEN_W, 210);
-    lv_obj_align(s_kb_wifi, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_keyboard_set_textarea(s_kb_wifi, s_ta_ssid);
+    int age_s = 0;
+    if (det->fetched_at_ms > 0) {
+        /* monotonic age is computed in the tick from a shared clock */
+    }
+    char ubuf[48];
+    snprintf(ubuf, sizeof(ubuf), "Updated %d s ago", age_s);
+    lv_label_set_text(s_det_updated, ubuf);
 
-    lv_obj_add_event_cb(s_ta_ssid, on_ta_focus, LV_EVENT_FOCUSED, s_ta_ssid);
-    lv_obj_add_event_cb(s_ta_pass, on_ta_focus, LV_EVENT_FOCUSED, s_ta_pass);
+    /* content: pending card first, else output lines */
+    lv_obj_clean(s_det_content);
+    if (det->pending.kind != PANEL_PENDING_NONE && det->pending.summary[0] != '\0') {
+        lv_obj_t *sum = lv_label_create(s_det_content);
+        lv_label_set_long_mode(sum, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(sum, 424);
+        lv_label_set_text(sum, det->pending.summary);
+        lv_obj_set_style_text_font(sum, ui_font(20), 0);
+        lv_obj_set_style_text_color(sum, lv_color_hex(COLOR_TEXT), 0);
+        lv_obj_set_pos(sum, 0, 0);
+
+        if (det->pending.impact[0] != '\0') {
+            lv_obj_t *imp = lv_label_create(s_det_content);
+            lv_label_set_long_mode(imp, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(imp, 424);
+            lv_label_set_text(imp, det->pending.impact);
+            lv_obj_set_style_text_font(imp, ui_font(18), 0);
+            lv_obj_set_style_text_color(imp, lv_color_hex(COLOR_DIM), 0);
+            lv_obj_set_pos(imp, 0, 72);
+        }
+
+        if (det->pending.kind == PANEL_PENDING_CONTINUATION &&
+            det->pending.prompt[0] != '\0') {
+            lv_obj_t *pr = lv_label_create(s_det_content);
+            lv_label_set_long_mode(pr, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(pr, 424);
+            lv_label_set_text(pr, det->pending.prompt);
+            lv_obj_set_style_text_font(pr, ui_font(18), 0);
+            lv_obj_set_style_text_color(pr, lv_color_hex(COLOR_ACCENT), 0);
+            lv_obj_set_pos(pr, 0, 120);
+        }
+    } else {
+        for (int i = 0; i < det->output_line_count; i++) {
+            lv_obj_t *ln = lv_label_create(s_det_content);
+            lv_label_set_long_mode(ln, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(ln, 424);
+            lv_label_set_text(ln, det->output_lines[i]);
+            lv_obj_set_style_text_font(ln, ui_font(16), 0);
+            lv_obj_set_style_text_color(ln, lv_color_hex(COLOR_DIM), 0);
+            lv_obj_set_pos(ln, 0, i * 20);
+        }
+        if (det->output_line_count == 0) {
+            ui_label(s_det_content, 0, 60, 424, "(no output)", 18, COLOR_DISABLED);
+        }
+    }
+
+    /* action visibility from gateway choices only */
+    bool online = (conn == PANEL_CONN_ONLINE);
+    bool fresh = det->valid && online;
+    uint8_t choices = fresh ? det->pending.choices : 0;
+
+    lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+
+    if (panel_store_action_reserved()) {
+        lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Action in progress");
+        lv_label_set_text(s_det_hint, "Wait for current action");
+        return;
+    }
+
+    if (det->pending.kind == PANEL_PENDING_APPROVAL ||
+        det->pending.kind == PANEL_PENDING_QUESTION) {
+        bool has_allow = (choices & PANEL_CHOICE_ALLOW_ONCE) != 0;
+        bool has_deny = (choices & PANEL_CHOICE_DENY) != 0;
+        if (has_allow && has_deny) {
+            lv_obj_clear_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_det_hint, "Confirm after action");
+        } else if (has_allow) {
+            lv_obj_clear_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_det_hint, "Confirm after action");
+        } else if (has_deny) {
+            lv_obj_clear_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_det_hint, "Confirm after action");
+        } else {
+            lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Use host terminal");
+            lv_label_set_text(s_det_hint, "Impact/options incomplete");
+        }
+    } else if ((det->herdr_status == PANEL_AGENT_IDLE ||
+                det->herdr_status == PANEL_AGENT_DONE) &&
+               (choices & PANEL_CHOICE_CONTINUE)) {
+        lv_obj_clear_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_det_hint, "Confirm shows full prompt");
+    } else if (det->pending.kind == PANEL_PENDING_UNRECOGNIZED ||
+               det->herdr_status == PANEL_AGENT_BLOCKED) {
+        lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Use host terminal");
+        lv_label_set_text(s_det_hint, "Pending card unrecognized");
+    } else if (!online) {
+        lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Offline, actions disabled");
+        lv_label_set_text(s_det_hint, "Reconnect to act");
+    } else {
+        lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "No action available");
+        lv_label_set_text(s_det_hint, "Use host terminal");
+    }
 }
 
-static void build_backend_form(void)
+/* ====================================================================== */
+/* CNF                                                                     */
+/* ====================================================================== */
+
+static void build_confirm(void)
 {
-    s_backend_form = build_form_common(on_back_settings, "Backend setup");
+    s_confirm = make_screen();
 
-    ui_label(s_backend_form, 12, 62, 300, "Host (IP or hostname)", 12, COLOR_DIM);
-    s_ta_host = make_textarea(s_backend_form, 12, 82, 456, "192.168.1.100", false);
-    ui_label(s_backend_form, 12, 136, 200, "Port", 12, COLOR_DIM);
-    s_ta_port = make_textarea(s_backend_form, 12, 156, 456, "8080", false);
-    lv_textarea_set_max_length(s_ta_port, 5);
+    lv_obj_t *back = ui_button(s_confirm, 8, 8, 56, 48, LV_SYMBOL_LEFT, COLOR_CARD, 22);
+    lv_obj_add_event_cb(back, on_confirm_cancel, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *save = make_button(s_backend_form, 12, 212, 456, 48,
-                                 "Save & Restart", COLOR_GREEN, 16);
-    lv_obj_add_event_cb(save, on_save_backend, LV_EVENT_CLICKED, NULL);
+    s_cnf_title = ui_label(s_confirm, 72, 18, 360, "Confirm", 26, COLOR_TEXT);
 
-    s_kb_backend = lv_keyboard_create(s_backend_form);
-    lv_obj_set_size(s_kb_backend, SCREEN_W, 210);
-    lv_obj_align(s_kb_backend, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_keyboard_set_textarea(s_kb_backend, s_ta_host);
+    ui_label(s_confirm, 16, 80, 448, "", 18, COLOR_DIM); /* spacer */
 
-    lv_obj_add_event_cb(s_ta_host, on_ta_focus, LV_EVENT_FOCUSED, s_ta_host);
-    lv_obj_add_event_cb(s_ta_port, on_ta_focus, LV_EVENT_FOCUSED, s_ta_port);
+    s_cnf_body = lv_label_create(s_confirm);
+    lv_label_set_long_mode(s_cnf_body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_pos(s_cnf_body, 16, 96);
+    lv_obj_set_width(s_cnf_body, 448);
+    lv_obj_set_height(s_cnf_body, 240);
+    lv_obj_set_style_text_font(s_cnf_body, ui_font(20), 0);
+    lv_obj_set_style_text_color(s_cnf_body, lv_color_hex(COLOR_TEXT), 0);
+
+    s_cnf_hint = ui_label(s_confirm, 16, 348, 448, "Auto-cancel after 10 s", 16, COLOR_DISABLED);
+
+    s_cnf_cancel = ui_button(s_confirm, 16, 372, 448, 48, "Cancel, back to detail", COLOR_CARD, 20);
+    s_cnf_ok = ui_button(s_confirm, 16, 428, 448, 48, "Confirm", COLOR_ACCENT, 22);
+    lv_obj_add_event_cb(s_cnf_cancel, on_confirm_cancel, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_cnf_ok, on_confirm_ok, LV_EVENT_CLICKED, NULL);
 }
+
+static void show_confirm(panel_action_id_t act, const panel_detail_t *det)
+{
+    s_pending_action = act;
+    s_frozen_pending = det->pending;
+
+    char body[512];
+    if (act == PANEL_ACT_CONTINUE) {
+        snprintf(body, sizeof(body),
+                 "%s · %s\n\nPrompt to send:\n%s",
+                 det->agent, det->pane_id,
+                 det->pending.prompt[0] ? det->pending.prompt : "(empty)");
+        lv_label_set_text(s_cnf_title, "Confirm continue");
+    } else if (act == PANEL_ACT_ALLOW_ALWAYS) {
+        snprintf(body, sizeof(body),
+                 "%s · %s\n\nRequest: %s\nImpact: %s\n\nMay change future approvals",
+                 det->agent, det->pane_id,
+                 det->pending.summary, det->pending.impact);
+        lv_label_set_text(s_cnf_title, "Confirm always allow");
+    } else if (act == PANEL_ACT_DENY) {
+        snprintf(body, sizeof(body),
+                 "%s · %s\n\nDeny request: %s\nImpact: %s",
+                 det->agent, det->pane_id,
+                 det->pending.summary, det->pending.impact);
+        lv_label_set_text(s_cnf_title, "Confirm deny");
+    } else {
+        snprintf(body, sizeof(body),
+                 "%s · %s\n\nRequest: %s\nCwd/impact: %s\nScope: this only",
+                 det->agent, det->pane_id,
+                 det->pending.summary, det->pending.impact);
+        lv_label_set_text(s_cnf_title, "Confirm allow once");
+    }
+    lv_label_set_text(s_cnf_body, body);
+    lv_label_set_text(s_cnf_ok, panel_action_id_name(act));
+    show_screen(SCR_CONFIRM);
+}
+
+/* ====================================================================== */
+/* RST                                                                     */
+/* ====================================================================== */
+
+static void build_result(void)
+{
+    s_result = make_screen();
+    s_rst_title = ui_label(s_result, 16, 80, 448, "", 28, COLOR_TEXT);
+    lv_obj_set_style_text_align(s_rst_title, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_rst_body = ui_label(s_result, 16, 160, 448, "", 20, COLOR_DIM);
+    lv_obj_set_style_text_align(s_rst_body, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_rst_back = ui_button(s_result, 16, 360, 448, 80, "Back to detail", COLOR_CARD, 22);
+    lv_obj_add_event_cb(s_rst_back, on_result_back, LV_EVENT_CLICKED, NULL);
+}
+
+static void show_result(const panel_action_result_t *r)
+{
+    switch (r->state) {
+    case PANEL_ACTION_SENDING:
+        lv_label_set_text(s_rst_title, "Sending...");
+        lv_label_set_text(s_rst_body, "Do not retry");
+        break;
+    case PANEL_ACTION_DELIVERED:
+        lv_label_set_text(s_rst_title, "Delivered");
+        lv_label_set_text(s_rst_body, "Waiting for agent");
+        break;
+    case PANEL_ACTION_OBSERVED:
+        lv_label_set_text(s_rst_title, "Done");
+        lv_label_set_text(s_rst_body, r->message[0] ? r->message : "Context changed (confirmed)");
+        break;
+    case PANEL_ACTION_STALE:
+        lv_label_set_text(s_rst_title, "Context changed");
+        lv_label_set_text(s_rst_body, "Prompt changed, review again");
+        break;
+    case PANEL_ACTION_UNSUPPORTED:
+        lv_label_set_text(s_rst_title, "Unsupported");
+        lv_label_set_text(s_rst_body, r->message[0] ? r->message : "Use host terminal");
+        break;
+    case PANEL_ACTION_UNAVAILABLE:
+        lv_label_set_text(s_rst_title, "Auth/protocol error");
+        lv_label_set_text(s_rst_body, r->message[0] ? r->message : "Update credentials");
+        break;
+    default:
+        lv_label_set_text(s_rst_title, "Result unknown");
+        lv_label_set_text(s_rst_body, "Check host; no auto-retry");
+        break;
+    }
+    show_screen(SCR_RESULT);
+}
+
+/* ====================================================================== */
+/* SET                                                                     */
+/* ====================================================================== */
+
+static void build_settings(void)
+{
+    s_settings = make_screen();
+
+    lv_obj_t *back = ui_button(s_settings, 8, 8, 56, 48, LV_SYMBOL_LEFT, COLOR_CARD, 22);
+    lv_obj_add_event_cb(back, on_back, LV_EVENT_CLICKED, (void *)(intptr_t)11);
+    ui_label(s_settings, 72, 22, 300, "Settings", 24, COLOR_TEXT);
+
+    /* 4 rows ≥84 px — view only, no virtual keyboard */
+    s_set_conn = lv_obj_create(s_settings);
+    lv_obj_set_pos(s_set_conn, 16, 80);
+    lv_obj_set_size(s_set_conn, 448, 100);
+    lv_obj_set_style_bg_color(s_set_conn, lv_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_bg_opa(s_set_conn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_set_conn, 12, 0);
+    ui_label(s_set_conn, 12, 12, 400, "Connection", 20, COLOR_TEXT);
+    ui_label(s_set_conn, 12, 44, 400, "", 16, COLOR_DIM);
+
+    s_set_display = lv_obj_create(s_settings);
+    lv_obj_set_pos(s_set_display, 16, 196);
+    lv_obj_set_size(s_set_display, 448, 100);
+    lv_obj_set_style_bg_color(s_set_display, lv_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_bg_opa(s_set_display, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_set_display, 12, 0);
+    ui_label(s_set_display, 12, 12, 400, "Display", 20, COLOR_TEXT);
+    ui_label(s_set_display, 12, 44, 400, "", 16, COLOR_DIM);
+
+    s_set_about = lv_obj_create(s_settings);
+    lv_obj_set_pos(s_set_about, 16, 312);
+    lv_obj_set_size(s_set_about, 448, 100);
+    lv_obj_set_style_bg_color(s_set_about, lv_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_bg_opa(s_set_about, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_set_about, 12, 0);
+    ui_label(s_set_about, 12, 12, 400, "About", 20, COLOR_TEXT);
+    ui_label(s_set_about, 12, 44, 400, "", 16, COLOR_DIM);
+
+    /* re-provision entry */
+    lv_obj_t *re = ui_button(s_settings, 16, 428, 448, 44, "Re-provision", COLOR_PENDING, 20);
+    lv_obj_add_event_cb(re, on_menu, LV_EVENT_CLICKED, (void *)(intptr_t)3);
+}
+
+static void refresh_settings(const panel_overview_t *ov, panel_conn_state_t conn)
+{
+    app_config_t cfg;
+    app_config_get(&cfg);
+
+    char buf[200];
+    /* Never render password/token. */
+    snprintf(buf, sizeof(buf), "Wi-Fi: %s\nServer: %s:%u · %s",
+             cfg.wifi_ssid, cfg.backend_host, (unsigned)cfg.backend_port,
+             panel_conn_state_name(conn));
+    lv_label_set_text(lv_obj_get_child(s_set_conn, 1), buf);
+
+    snprintf(buf, sizeof(buf), "Bright %d%% · Reduce motion %s",
+             s_brightness, s_reduce_motion ? "On" : "Off");
+    lv_label_set_text(lv_obj_get_child(s_set_display, 1), buf);
+
+    snprintf(buf, sizeof(buf), "FW v0.2 · Proto v1 · Sessions %d", ov->count);
+    lv_label_set_text(lv_obj_get_child(s_set_about, 1), buf);
+}
+
+/* ====================================================================== */
+/* PRV                                                                     */
+/* ====================================================================== */
 
 static void build_provision(void)
 {
-    s_provision = new_screen();
-    ui_label(s_provision, 12, 12, 456, "Setup Mode", 20, COLOR_TEXT);
+    s_prov = make_screen();
+    ui_label(s_prov, 16, 24, 448, "Join device hotspot", 28, COLOR_TEXT);
+    lv_obj_set_style_text_align(lv_obj_get_child(s_prov, 0), LV_TEXT_ALIGN_CENTER, 0);
 
-    s_prov_qr = lv_qrcode_create(s_provision);
-    lv_qrcode_set_size(s_prov_qr, 220);
-    lv_qrcode_set_dark_color(s_prov_qr, lv_color_black());
-    lv_qrcode_set_light_color(s_prov_qr, lv_color_white());
-    lv_obj_set_pos(s_prov_qr, 130, 64);
+    /* white quiet zone */
+    lv_obj_t *zone = lv_obj_create(s_prov);
+    lv_obj_set_pos(zone, 112, 92);
+    lv_obj_set_size(zone, 256, 256);
+    lv_obj_set_style_bg_color(zone, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(zone, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(zone, 8, 0);
+    lv_obj_set_style_pad_all(zone, 12, 0);
+    lv_obj_set_style_border_width(zone, 0, 0);
 
-    s_prov_info = ui_label(s_provision, 24, 306, 432, "", 14, COLOR_TEXT);
+#if LV_USE_QRCODE
+    s_prov_qr = lv_qrcode_create(zone);
+    lv_qrcode_set_size(s_prov_qr, 232);
+    lv_qrcode_set_dark_color(s_prov_qr, lv_color_hex(0x000000));
+    lv_qrcode_set_light_color(s_prov_qr, lv_color_hex(0xFFFFFF));
+    lv_qrcode_set_quiet_zone(s_prov_qr, true);
+    lv_obj_center(s_prov_qr);
+#else
+    s_prov_qr = NULL;
+    ui_label(zone, 20, 100, 216, "QR", 24, 0x000000);
+#endif
+
+    s_prov_info = ui_label(s_prov, 16, 360, 448, "", 18, COLOR_TEXT);
     lv_obj_set_style_text_align(s_prov_info, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_prov_info, LV_LABEL_LONG_WRAP);
-
-    lv_obj_t *hint = ui_label(s_provision, 24, 396, 432,
-        "Scan with your phone to join, the setup page\nopens automatically (or visit http://192.168.4.1)",
-        12, COLOR_DIM);
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_height(s_prov_info, 100);
 }
 
-/* --- public API ----------------------------------------------------------- */
+static void show_provision_screen(const char *ssid, const char *pass, const char *qr)
+{
+    snprintf(s_prov_ssid, sizeof(s_prov_ssid), "%s", ssid ? ssid : "");
+    snprintf(s_prov_pass, sizeof(s_prov_pass), "%s", pass ? pass : "");
+    snprintf(s_prov_qr_text, sizeof(s_prov_qr_text), "%s", qr ? qr : "");
+
+#if LV_USE_QRCODE
+    if (s_prov_qr != NULL) {
+        lv_qrcode_update(s_prov_qr, s_prov_qr_text, strlen(s_prov_qr_text));
+    }
+#endif
+
+    char info[192];
+    snprintf(info, sizeof(info),
+             "SSID: %s\nPass: %s\nScan to join Wi-Fi\nNo page? 192.168.4.1",
+             s_prov_ssid, s_prov_pass);
+    lv_label_set_text(s_prov_info, info);
+    show_screen(SCR_PROVISION);
+}
+
+/* ====================================================================== */
+/* screen switching / events                                              */
+/* ====================================================================== */
+
+static void show_screen(screen_t s)
+{
+    s_screen = s;
+    lv_obj_t *scr = NULL;
+    switch (s) {
+    case SCR_HOME: scr = s_home; break;
+    case SCR_DETAIL: scr = s_detail; break;
+    case SCR_CONFIRM: scr = s_confirm; break;
+    case SCR_RESULT: scr = s_result; break;
+    case SCR_SETTINGS: scr = s_settings; break;
+    case SCR_PROVISION: scr = s_prov; break;
+    }
+    if (scr != NULL) lv_screen_load(scr);
+}
+
+static void on_card(lv_event_t *e)
+{
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (slot < 0 || slot >= 4) return;
+    const char *term = s_cells[slot].terminal_id;
+    if (term[0] == '\0') return;
+
+    bump_epoch();
+    snprintf(s_sel_term, sizeof(s_sel_term), "%s", term);
+
+    panel_cmd_t cmd = {
+        .type = PANEL_CMD_OPEN_DETAIL,
+        .selection_epoch = s_sel_epoch,
+    };
+    snprintf(cmd.terminal_id, sizeof(cmd.terminal_id), "%s", term);
+    if (!panel_store_enqueue_control(&cmd)) {
+        /* queue full: non-blocking, show busy */
+        return;
+    }
+    show_screen(SCR_DETAIL);
+}
+
+static void on_menu(lv_event_t *e)
+{
+    void *ud = lv_event_get_user_data(e);
+    if (ud == (void *)(intptr_t)3) {
+        /* re-provision: clear creds + restart into SoftAP */
+        app_config_clear_credentials();
+        esp_restart();
+        return;
+    }
+    if (s_screen == SCR_HOME) {
+        panel_overview_t ov;
+        panel_conn_state_t conn;
+        panel_store_get_overview(&ov, &conn);
+        refresh_settings(&ov, conn);
+        show_screen(SCR_SETTINGS);
+    }
+}
+
+static void on_back(lv_event_t *e)
+{
+    void *ud = lv_event_get_user_data(e);
+    intptr_t code = (intptr_t)ud;
+
+    if (code == 100) { /* prev page */
+        if (s_page > 0) s_page--;
+        return;
+    }
+    if (code == 101) { /* next page */
+        int pages = (s_card_count + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (pages < 1) pages = 1;
+        if (s_page < pages - 1) s_page++;
+        return;
+    }
+
+    if (s_screen == SCR_DETAIL) {
+        bump_epoch();
+        s_sel_term[0] = '\0';
+        show_screen(SCR_HOME);
+    } else if (s_screen == SCR_SETTINGS || s_screen == SCR_RESULT) {
+        show_screen(SCR_HOME);
+    } else if (s_screen == SCR_CONFIRM) {
+        s_pending_action = PANEL_ACT_NONE;
+        show_screen(SCR_DETAIL);
+    }
+}
+
+static void on_refresh(lv_event_t *e)
+{
+    (void)e;
+    panel_cmd_t cmd = { .type = PANEL_CMD_REFRESH };
+    panel_store_enqueue_control(&cmd);
+}
+
+static void on_action_btn(lv_event_t *e)
+{
+    panel_action_id_t act = (panel_action_id_t)(intptr_t)lv_event_get_user_data(e);
+    panel_detail_t det;
+    if (!panel_store_get_detail(&det)) return;
+    if (!selection_matches(det.terminal_id, det.selection_epoch) &&
+        strcmp(s_sel_term, det.terminal_id) != 0) {
+        return;
+    }
+    /* freeze card; confirm page shows impact */
+    show_confirm(act, &det);
+}
+
+static void on_confirm_cancel(lv_event_t *e)
+{
+    (void)e;
+    s_pending_action = PANEL_ACT_NONE;
+    show_screen(SCR_DETAIL);
+}
+
+static void on_confirm_ok(lv_event_t *e)
+{
+    (void)e;
+    if (s_pending_action == PANEL_ACT_NONE) return;
+    if (panel_store_action_reserved()) {
+        show_result(&(panel_action_result_t){
+            .state = PANEL_ACTION_SENDING,
+        });
+        return;
+    }
+    if (!panel_store_try_reserve_action()) {
+        lv_label_set_text(s_cnf_hint, "Busy, try later");
+        return;
+    }
+
+    panel_detail_t det;
+    if (!panel_store_get_detail(&det)) {
+        panel_store_release_action();
+        return;
+    }
+
+    panel_cmd_t cmd = {
+        .type = PANEL_CMD_ACTION,
+        .action = s_pending_action,
+        .selection_epoch = s_sel_epoch,
+    };
+    snprintf(cmd.terminal_id, sizeof(cmd.terminal_id), "%s", s_sel_term);
+    snprintf(cmd.context_token, sizeof(cmd.context_token), "%s", s_frozen_pending.context_token);
+    if (s_pending_action == PANEL_ACT_CONTINUE) {
+        snprintf(cmd.prompt, sizeof(cmd.prompt), "%s", s_frozen_pending.prompt);
+    }
+
+    if (!panel_store_enqueue_action(&cmd)) {
+        panel_store_release_action();
+        lv_label_set_text(s_cnf_hint, "Busy, try later");
+        return;
+    }
+
+    s_pending_action = PANEL_ACT_NONE;
+    panel_action_result_t sending = { .state = PANEL_ACTION_SENDING };
+    snprintf(sending.message, sizeof(sending.message), "Sending...");
+    show_result(&sending);
+}
+
+static void on_result_back(lv_event_t *e)
+{
+    (void)e;
+    if (s_sel_term[0] != '\0') {
+        show_screen(SCR_DETAIL);
+    } else {
+        show_screen(SCR_HOME);
+    }
+}
+
+/* ====================================================================== */
+/* public                                                                  */
+/* ====================================================================== */
 
 void ui_panel_init(void)
 {
     build_home();
     build_detail();
+    build_confirm();
+    build_result();
     build_settings();
-    build_wifi_form();
-    build_backend_form();
     build_provision();
-    lv_screen_load(s_home);
-    refresh_grid();
+    show_screen(SCR_HOME);
 }
 
-void ui_show_provisioning(const char *ap_ssid, const char *qr_payload)
+void ui_show_provisioning(const char *ap_ssid, const char *ap_pass, const char *qr_payload)
 {
-    s_screen = SCR_PROVISION;
-    lv_qrcode_update(s_prov_qr, qr_payload, strlen(qr_payload));
-    lv_label_set_text_fmt(s_prov_info,
-                          "Join WiFi:  %s\nThen open:  http://192.168.4.1",
-                          ap_ssid);
-    lv_screen_load(s_provision);
+    show_provision_screen(ap_ssid, ap_pass, qr_payload);
 }
 
 void ui_panel_tick(void)
 {
-    /* consume shared state updates produced by the network task */
-    if (g_snap_dirty && xSemaphoreTake(g_snap_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
-        memcpy(s_sessions, g_snap.sessions, sizeof(s_sessions));
-        s_count = g_snap.count;
-        xSemaphoreGive(g_snap_lock);
-        g_snap_dirty = false;
-
-        if (s_screen == SCR_HOME) {
-            refresh_grid();
+    /* 1. drain one-shot UI events (action results etc.) */
+    panel_ui_evt_t evt;
+    while (panel_store_recv_ui_event(&evt, 0)) {
+        if (evt.type == PANEL_EVT_ACTION_RESULT) {
+            if (s_screen == SCR_CONFIRM || s_screen == SCR_RESULT) {
+                show_result(&evt.action);
+            }
         }
     }
 
-    if (g_output_dirty) {
-        g_output_dirty = false;
-        if (s_screen == SCR_DETAIL) {
-            lv_label_set_text(s_det_output, g_output_buf);
-        }
-    }
+    /* 2. redraw when store generation changed */
+    uint32_t gen = panel_store_generation();
+    if (gen == s_seen_generation) return;
+    s_seen_generation = gen;
 
-    if (g_toast_dirty) {
-        g_toast_dirty = false;
-        if (s_screen == SCR_DETAIL) {
-            lv_label_set_text(s_det_toast, g_toast);
-        }
-    }
+    panel_overview_t ov;
+    panel_conn_state_t conn;
+    panel_store_get_overview(&ov, &conn);
+    s_card_count = ov.count;
 
-    if (g_conn_dirty) {
-        g_conn_dirty = false;
-        lv_label_set_text(s_conn_label, g_conn);
-    }
-
-    /* keep the detail output fresh while the page is open */
-    if (s_screen == SCR_DETAIL && s_selected >= 0 && s_selected < s_count) {
-        uint32_t now = lv_tick_get();
-        if (now - s_last_output_fetch > 3000) {
-            panel_fetch_output(s_sessions[s_selected].pane_id);
-            s_last_output_fetch = now;
+    if (s_screen == SCR_HOME) {
+        refresh_home(&ov, conn);
+    } else if (s_screen == SCR_DETAIL) {
+        panel_detail_t det;
+        if (panel_store_get_detail(&det)) {
+            if (strcmp(det.terminal_id, s_sel_term) == 0) {
+                render_detail(&det, conn);
+            }
         }
+    } else if (s_screen == SCR_SETTINGS) {
+        refresh_settings(&ov, conn);
     }
 }

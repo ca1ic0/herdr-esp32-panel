@@ -1,8 +1,10 @@
 #pragma once
 
 /*
- * Persistent application configuration (WiFi + backend) stored in NVS.
- * Falls back to Kconfig defaults when NVS is empty.
+ * config_service: the only NVS owner.
+ *
+ * Holds Wi-Fi credentials, gateway URL, and the device Bearer token.
+ * Secrets are never logged or rendered into LVGL labels.
  */
 
 #include <stdbool.h>
@@ -15,27 +17,50 @@
 extern "C" {
 #endif
 
+#define CFG_SSID_MAX       32
+#define CFG_PASS_MAX       64
+#define CFG_HOST_MAX       63
+#define CFG_TOKEN_MAX      95
+
 typedef struct {
-    char wifi_ssid[33];
-    char wifi_pass[65];
-    char backend_host[64];
+    char wifi_ssid[CFG_SSID_MAX + 1];
+    char wifi_pass[CFG_PASS_MAX + 1];
+    char backend_host[CFG_HOST_MAX + 1];
     uint16_t backend_port;
+    char gateway_token[CFG_TOKEN_MAX + 1];   /* device-specific Bearer */
+    bool https;                              /* reserved; v1 is LAN HTTP */
 } app_config_t;
 
-/** Initialise NVS and load the configuration. Call once at boot. */
-void app_config_init(void);
+/** Initialise NVS once and load stored config. Call exactly once at boot. */
+esp_err_t app_config_init(void);
 
-/** Copy the current configuration (thread-safe). */
+/** Thread-safe copy of the current configuration. */
 void app_config_get(app_config_t *out);
 
-/** Persist a new configuration to NVS (thread-safe). */
+/**
+ * Validate + persist. Checks field lengths and rejects empty SSID/host.
+ * Returns ESP_ERR_INVALID_ARG on bad input, or NVS errors. Never reports
+ * success when nvs_commit fails.
+ */
 esp_err_t app_config_save(const app_config_t *cfg);
 
-/** True when a usable WiFi SSID has been configured. */
+/** True when a real (non-placeholder) SSID has been stored. */
 bool app_config_is_configured(void);
 
-/** Build "http://host:port" from the current configuration. */
+/** Build "http://host:port" (or https) from the current configuration. */
 void app_config_base_url(char *buf, size_t buflen);
+
+/**
+ * Build "Bearer <token>" or "" when no token is stored.
+ * Used only by panel_api_client as an Authorization header.
+ */
+void app_config_auth_header(char *buf, size_t buflen);
+
+/** Clear Wi-Fi + gateway credentials (re-provisioning). */
+esp_err_t app_config_clear_credentials(void);
+
+/** Single NVS flash init (used by app_config_init). */
+esp_err_t app_config_nvs_init(void);
 
 #ifdef __cplusplus
 }
