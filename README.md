@@ -72,6 +72,10 @@ idf.py -p PORT flash monitor
 
 要求 ESP-IDF ≥ 5.x（维护环境 6.1），LVGL 9.x。
 
+## 字体
+
+`main/fonts/` 内是预生成的 CJK 位图字体（GB2312 一级汉字 3755 字 + 常用标点，16/20/24px），由 `tools/fonts/make_cjk_fonts.sh` 用 lv_font_conv 从 Noto Sans CJK SC 光栅化而来，作为 Montserrat 的 LVGL fallback 链生效。重新生成需要 node/npx 与 `tools/fonts/NotoSansCJKsc-Regular.otf`（不随仓库分发）。Contains rasterized glyphs from Noto Sans CJK SC, licensed under the SIL Open Font License 1.1.
+
 ## 配网
 
 1. 首次开机或选择“重新配网”后进入 WPA2 SoftAP `HerdrPanel-XXXX`。
@@ -85,7 +89,7 @@ idf.py -p PORT flash monitor
 
 按 [ACCEPTANCE.md](docs/ACCEPTANCE.md)，当前仓库可见的实现是：
 
-- **A 硬件与文字骨架**：BSP 沿用，中文需补 CJK 字体资产（见 `ui_common.h`）。
+- **A 硬件与文字骨架**：BSP 沿用，CJK 字体资产已生成入库（`main/fonts/`，见「字体」节）。
 - **B 只读面板**：四宫格、详情和连接状态的固件代码已写入；0/1/4/5/24/25 会话仍需实机复核。
 - **C 网关决策（主机侧）**：`herdr-restful/backend/app/panel/` 已实现 overview/detail/actions、上下文令牌、终端锁与幂等去重，并有 12 个自动化测试；已对活 Herdr 0.9.0 验证只读路径（注意 herdr `agent.*` 方法参数是 `target`）。真实 CLI 审批端到端仍需验证。
 - **D 设备动作**：确认页、发送/回读状态机及结果未知处理的固件代码已写入；真实 CLI 端到端仍需验证。
