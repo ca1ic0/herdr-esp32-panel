@@ -114,7 +114,8 @@ esp_err_t panel_prefs_init(void)
     size_t len = sizeof(blob);
     err = nvs_get_blob(h, PREFS_KEY, &blob, &len);
     nvs_close(h);
-    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err == ESP_ERR_NVS_NOT_FOUND || err == ESP_ERR_NVS_INVALID_LENGTH)
+        return ESP_OK;
     if (err != ESP_OK) return err;
     if (len == sizeof(blob) && blob.schema == PREFS_SCHEMA &&
         valid_all(&blob.prefs)) s_prefs = blob.prefs;

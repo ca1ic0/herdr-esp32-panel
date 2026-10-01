@@ -670,6 +670,7 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
         }
 
         if (det->pending.kind == PANEL_PENDING_CONTINUATION &&
+            det->pending.source == PANEL_SOURCE_NEW_PROMPT &&
             det->pending.prompt[0] != '\0') {
             lv_obj_t *pr = lv_label_create(s_det_content);
             lv_label_set_long_mode(pr, LV_LABEL_LONG_WRAP);
@@ -785,15 +786,23 @@ static void build_confirm(void)
 
     ui_label(s_confirm, 16, 80, 448, "", 18, COLOR_DIM); /* spacer */
 
-    s_cnf_body = lv_label_create(s_confirm);
+    lv_obj_t *body_scroll = lv_obj_create(s_confirm);
+    lv_obj_set_pos(body_scroll, 16, 88);
+    lv_obj_set_size(body_scroll, 448, 248);
+    lv_obj_set_style_bg_opa(body_scroll, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(body_scroll, 0, 0);
+    lv_obj_set_style_pad_all(body_scroll, 0, 0);
+    lv_obj_set_scroll_dir(body_scroll, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(body_scroll, LV_SCROLLBAR_MODE_ACTIVE);
+    s_cnf_body = lv_label_create(body_scroll);
     lv_label_set_long_mode(s_cnf_body, LV_LABEL_LONG_WRAP);
-    lv_obj_set_pos(s_cnf_body, 16, 96);
-    lv_obj_set_width(s_cnf_body, 448);
-    lv_obj_set_height(s_cnf_body, 240);
+    lv_obj_set_pos(s_cnf_body, 0, 0);
+    lv_obj_set_width(s_cnf_body, 424);
+    lv_obj_set_height(s_cnf_body, LV_SIZE_CONTENT);
     lv_obj_set_style_text_font(s_cnf_body, ui_font(20), 0);
     lv_obj_set_style_text_color(s_cnf_body, lv_color_hex(COLOR_TEXT), 0);
 
-    s_cnf_hint = ui_label(s_confirm, 16, 348, 448, "10 秒后自动取消", 16, COLOR_DISABLED);
+    s_cnf_hint = ui_label(s_confirm, 16, 348, 448, "可上滑看全文 · 10 秒后取消", 16, COLOR_DISABLED);
 
     s_cnf_cancel = ui_button(s_confirm, 16, 372, 448, 48, "取消，返回详情", COLOR_CARD, 20);
     s_cnf_ok = ui_button(s_confirm, 16, 428, 448, 48, "确认", COLOR_ACCENT, 22);
@@ -808,11 +817,18 @@ static void show_confirm(panel_action_id_t act, const panel_detail_t *det)
     s_confirm_started_ms = ui_now_ms();
 
     char body[512];
-    if (act == PANEL_ACT_CONTINUE) {
+    if (act == PANEL_ACT_CONTINUE &&
+        det->pending.source == PANEL_SOURCE_NEW_PROMPT) {
         snprintf(body, sizeof(body),
                  "%s · %s\n\n将发送的提示词：\n%s",
                  det->agent, det->pane_id,
                  det->pending.prompt[0] ? det->pending.prompt : "（空）");
+        lv_label_set_text(s_cnf_title, "确认继续");
+    } else if (act == PANEL_ACT_CONTINUE) {
+        snprintf(body, sizeof(body),
+                 "%s · %s\n\n将选择终端中的继续选项：\n%s\n影响：%s",
+                 det->agent, det->pane_id,
+                 det->pending.summary, det->pending.impact);
         lv_label_set_text(s_cnf_title, "确认继续");
     } else if (act == PANEL_ACT_ALLOW_ALWAYS) {
         snprintf(body, sizeof(body),
@@ -835,7 +851,7 @@ static void show_confirm(panel_action_id_t act, const panel_detail_t *det)
     }
     lv_label_set_text(s_cnf_body, body);
     lv_label_set_text(lv_obj_get_child(s_cnf_ok, 0), panel_action_id_name(act));
-    lv_label_set_text(s_cnf_hint, "10 秒后自动取消");
+    lv_label_set_text(s_cnf_hint, "可上滑看全文 · 10 秒后取消");
     show_screen(SCR_CONFIRM);
 }
 
@@ -863,6 +879,7 @@ static bool confirmed_request_current(void)
         det.fetched_at_ms <= 0 ||
         ui_now_ms() - det.fetched_at_ms > 10000 ||
         det.pending.kind != s_frozen_pending.kind ||
+        det.pending.source != s_frozen_pending.source ||
         !(det.pending.choices & action_choice(s_pending_action)) ||
         strcmp(det.pending.context_token, s_frozen_pending.context_token) != 0)
         return false;
@@ -1493,7 +1510,8 @@ static void on_confirm_ok(lv_event_t *e)
     };
     snprintf(cmd.terminal_id, sizeof(cmd.terminal_id), "%s", s_sel_term);
     snprintf(cmd.context_token, sizeof(cmd.context_token), "%s", s_frozen_pending.context_token);
-    if (s_pending_action == PANEL_ACT_CONTINUE) {
+    if (s_pending_action == PANEL_ACT_CONTINUE &&
+        s_frozen_pending.source == PANEL_SOURCE_NEW_PROMPT) {
         snprintf(cmd.prompt, sizeof(cmd.prompt), "%s", s_frozen_pending.prompt);
     }
 

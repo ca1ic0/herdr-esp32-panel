@@ -82,6 +82,12 @@ typedef enum {
     PANEL_PENDING_UNRECOGNIZED,
 } panel_pending_kind_t;
 
+typedef enum {
+    PANEL_SOURCE_NONE = 0,
+    PANEL_SOURCE_TERMINAL_UI,
+    PANEL_SOURCE_NEW_PROMPT,
+} panel_pending_source_t;
+
 /* Semantic actions. Firmware never hardcodes CLI keystrokes. */
 typedef enum {
     PANEL_ACT_NONE = 0,
@@ -127,6 +133,7 @@ typedef struct {
 
 typedef struct {
     panel_pending_kind_t kind;
+    panel_pending_source_t source;
     char summary[PANEL_SUMMARY_LEN];
     char impact[PANEL_IMPACT_LEN];
     uint8_t choices;                /* PANEL_CHOICE_* bitmask */

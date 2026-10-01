@@ -329,6 +329,42 @@ static panel_http_result_t parse_detail(const char *json, uint32_t epoch,
                     out->pending.choices |= PANEL_CHOICE_CONTINUE;
             }
         }
+
+        /* The confirmation screen must never approve a card whose text was
+         * truncated by the device's bounded model. Keep the detail readable,
+         * but force the decision to be made on the host. */
+        cJSON *source = cJSON_GetObjectItemCaseSensitive(pending, "source");
+        bool new_prompt = cJSON_IsString(source) &&
+                          strcmp(source->valuestring, "new_prompt") == 0;
+        bool terminal_ui = cJSON_IsString(source) &&
+                           strcmp(source->valuestring, "terminal_ui") == 0;
+        out->pending.source = new_prompt ? PANEL_SOURCE_NEW_PROMPT :
+                              terminal_ui ? PANEL_SOURCE_TERMINAL_UI :
+                              PANEL_SOURCE_NONE;
+        bool has_continue = (out->pending.choices & PANEL_CHOICE_CONTINUE) != 0;
+        if (out->pending.choices != 0 &&
+            (!string_fits(pending, "summary", sizeof(out->pending.summary)) ||
+             !string_fits(pending, "impact", sizeof(out->pending.impact)) ||
+             out->pending.summary[0] == '\0' ||
+             out->pending.impact[0] == '\0' ||
+             (has_continue && !new_prompt && !terminal_ui) ||
+             (has_continue && new_prompt &&
+              (!string_fits(pending, "prompt", sizeof(out->pending.prompt)) ||
+               out->pending.prompt[0] == '\0')) ||
+             (has_continue && terminal_ui &&
+              cJSON_IsString(cJSON_GetObjectItemCaseSensitive(pending, "prompt")) &&
+              !string_fits(pending, "prompt", sizeof(out->pending.prompt))))) {
+            out->pending.kind = PANEL_PENDING_UNRECOGNIZED;
+            out->pending.choices = 0;
+            out->pending.context_token[0] = '\0';
+            out->pending.impact[0] = '\0';
+            out->pending.prompt[0] = '\0';
+            snprintf(out->pending.summary, sizeof(out->pending.summary),
+                     "内容过长或缺失，请在主机处理");
+        } else if (terminal_ui) {
+            /* A terminal choice sends keys, never a free-form prompt. */
+            out->pending.prompt[0] = '\0';
+        }
     }
 
     cJSON_Delete(root);
