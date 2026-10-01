@@ -1,6 +1,6 @@
 # 开机白屏诊断
 
-用 ESP-IDF 扩展的 **Build, Flash and Monitor** 烧录当前固件并查看串口。请保留从复位开始的完整日志；只看最后一行通常无法区分持续白屏与反复重启。
+先删除项目根目录里的生成文件 `sdkconfig`，让 ESP-IDF 从更新后的 `sdkconfig.defaults` 重新生成配置；现有 `sdkconfig` 不会自动继承新的 LVGL 内存大小。这一步不会清除设备上的配网凭据。然后用 ESP-IDF 扩展的 **Build, Flash and Monitor** 烧录当前固件并查看串口。请保留从复位开始的完整日志；只看最后一行通常无法区分持续白屏与反复重启。
 
 正常启动应依次看到：
 
