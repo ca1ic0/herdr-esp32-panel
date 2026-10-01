@@ -83,15 +83,19 @@ static void generate_request_id(char *out, size_t len)
 
 /* ---- server_id change wipes cache ------------------------------------ */
 
+/* Shared zero snapshots used to clear the store. Read-only (BSS-zeroed).
+ * Local copies of these cost 8 KB + 1.5 KB of stack and overflowed the
+ * 16 KB worker stack on the overview poll path. */
+static panel_overview_t s_zero_overview;
+static panel_detail_t s_zero_detail;
+
 static void handle_server_id(const char *sid)
 {
     if (sid == NULL || sid[0] == '\0') return;
     if (s_server_id[0] != '\0' && strcmp(s_server_id, sid) != 0) {
         ESP_LOGW(TAG, "server_id changed %s -> %s, clearing cache", s_server_id, sid);
-        panel_overview_t empty = { 0 };
-        panel_detail_t dempty = { 0 };
-        panel_store_publish_overview(&empty);
-        panel_store_publish_detail(&dempty);
+        panel_store_publish_overview(&s_zero_overview);
+        panel_store_publish_detail(&s_zero_detail);
         s_selected_term[0] = '\0';
         s_action_state = PANEL_ACTION_UNAVAILABLE;
         panel_store_release_action();
@@ -215,7 +219,9 @@ static void poll_overview(int64_t now_ms)
         return;
     }
 
-    panel_overview_t ov;
+    /* static: 8 KB snapshot; worker task is the only writer and the fetch
+     * path memsets the output before filling it. */
+    static panel_overview_t ov;
     s_http_phase = "overview";
     panel_http_result_t hr = panel_api_fetch_overview(&ov);
     if (hr == PANEL_HTTP_OK) {
@@ -342,7 +348,8 @@ static void poll_detail(int64_t now_ms)
         return;
     }
 
-    panel_detail_t det;
+    /* static: keeps large snapshots off the 16 KB worker stack */
+    static panel_detail_t det;
     s_http_phase = "detail";
     panel_http_result_t hr = panel_api_fetch_detail(s_selected_term,
                                                     s_selection_epoch, &det);
@@ -388,16 +395,14 @@ static void open_detail(const panel_cmd_t *cmd)
     s_selection_epoch = cmd->selection_epoch;
     s_next_detail_ms = 0;   /* fetch immediately */
     /* invalidate old detail */
-    panel_detail_t empty = { 0 };
-    panel_store_publish_detail(&empty);
+    panel_store_publish_detail(&s_zero_detail);
 }
 
 static void close_detail(void)
 {
     s_selected_term[0] = '\0';
     s_next_detail_ms = INT64_MAX;   /* stop polling an unseen detail */
-    panel_detail_t empty = { 0 };
-    panel_store_publish_detail(&empty);
+    panel_store_publish_detail(&s_zero_detail);
 }
 
 /* ---- periodic diagnostics (architecture §6) --------------------------- */
@@ -517,8 +522,9 @@ static void worker_task(void *arg)
 
 void panel_worker_start(void)
 {
-    /* 16 KB stack: JSON parse + 6-12 KB response buffers are static,
-     * but cJSON tree still needs headroom. Measured later. */
+    /* 16 KB stack: response buffers and the multi-KB panel snapshots are
+     * static (worker task is their only user), so just the HTTP/JSON call
+     * chain runs on the stack. cJSON trees allocate on the heap. */
     xTaskCreatePinnedToCore(worker_task, "panel_worker", 16 * 1024, NULL, 5, &s_task, 0);
     ESP_LOGI(TAG, "worker started");
 }

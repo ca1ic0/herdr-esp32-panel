@@ -34,5 +34,5 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\tinys\\hello_world\\build"
   ],
-  "idf.flashType": "JTAG"
+  "idf.flashType": "UART"
 }
