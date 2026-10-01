@@ -10,8 +10,10 @@
 #include "panel_worker.h"
 
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -31,6 +33,7 @@ static const char *TAG = "panel_worker";
 #define DETAIL_PERIOD_MS        2000
 #define BACKOFF_MAX_MS          15000
 #define DELIVERED_CONFIRM_MS    5000
+#define DIAG_PERIOD_MS          60000
 
 static TaskHandle_t s_task;
 static volatile bool s_kick_refresh;
@@ -42,6 +45,8 @@ static char s_server_id[PANEL_SERVER_ID_LEN];
 static int64_t s_next_overview_ms;
 static int64_t s_next_detail_ms;
 static int s_backoff_ms;
+static int64_t s_next_diag_ms;
+static const char *s_http_phase = "boot";
 static panel_action_state_t s_action_state = PANEL_ACTION_UNAVAILABLE;
 static char s_action_rid[PANEL_REQUEST_ID_LEN];
 static int64_t s_action_sent_ms;
@@ -84,13 +89,30 @@ static void handle_server_id(const char *sid)
 
 /* ---- posting UI events ----------------------------------------------- */
 
+/*
+ * Action results must never be silently dropped (architecture §5.1).
+ * If the UI event queue is full the event is parked in this worker-local
+ * slot and re-posted on every loop iteration until it lands.
+ */
+static panel_ui_evt_t s_parked_evt;
+static bool s_parked_evt_valid;
+
 static void post_action_result(const panel_action_result_t *r, uint32_t epoch)
 {
     panel_ui_evt_t evt = { .type = PANEL_EVT_ACTION_RESULT };
     evt.action = *r;
     evt.action.selection_epoch = epoch;
     if (!panel_store_post_ui_event(&evt)) {
-        ESP_LOGE(TAG, "ui_evt_q full, action result kept in worker slot");
+        s_parked_evt = evt;
+        s_parked_evt_valid = true;
+        ESP_LOGW(TAG, "ui_evt_q full, action result parked in worker slot");
+    }
+}
+
+static void flush_parked_event(void)
+{
+    if (s_parked_evt_valid && panel_store_post_ui_event(&s_parked_evt)) {
+        s_parked_evt_valid = false;
     }
 }
 
@@ -120,6 +142,7 @@ static void run_action(panel_cmd_t *cmd)
     snprintf(ac.request_id, sizeof(ac.request_id), "%s", rid);
 
     panel_action_result_t result;
+    s_http_phase = "action";
     panel_http_result_t hr = panel_api_post_action(&ac, &result);
     if (hr != PANEL_HTTP_OK) {
         result.state = PANEL_ACTION_UNCERTAIN;
@@ -171,6 +194,7 @@ static void poll_overview(int64_t now_ms)
     }
 
     panel_overview_t ov;
+    s_http_phase = "overview";
     panel_http_result_t hr = panel_api_fetch_overview(&ov);
     if (hr == PANEL_HTTP_OK) {
         handle_server_id(ov.server_id);
@@ -201,6 +225,7 @@ static void poll_detail(int64_t now_ms)
     }
 
     panel_detail_t det;
+    s_http_phase = "detail";
     panel_http_result_t hr = panel_api_fetch_detail(s_selected_term,
                                                     s_selection_epoch, &det);
     if (hr == PANEL_HTTP_OK) {
@@ -216,6 +241,15 @@ static void poll_detail(int64_t now_ms)
         s_next_detail_ms = now_ms + DETAIL_PERIOD_MS;
 
         /* blocked without poll wait: already handled by schedule */
+    } else if (hr == PANEL_HTTP_GONE) {
+        /* session ended: publish a marker and stop polling it */
+        panel_detail_t ended = { 0 };
+        ended.valid = true;
+        ended.gone = true;
+        ended.fetched_at_ms = now_ms;
+        snprintf(ended.terminal_id, sizeof(ended.terminal_id), "%s", s_selected_term);
+        panel_store_publish_detail(&ended);
+        s_next_detail_ms = INT64_MAX;
     } else {
         s_next_detail_ms = now_ms + DETAIL_PERIOD_MS;
     }
@@ -229,6 +263,28 @@ static void open_detail(const panel_cmd_t *cmd)
     /* invalidate old detail */
     panel_detail_t empty = { 0 };
     panel_store_publish_detail(&empty);
+}
+
+static void close_detail(void)
+{
+    s_selected_term[0] = '\0';
+    s_next_detail_ms = INT64_MAX;   /* stop polling an unseen detail */
+    panel_detail_t empty = { 0 };
+    panel_store_publish_detail(&empty);
+}
+
+/* ---- periodic diagnostics (architecture §6) --------------------------- */
+
+static void log_diagnostics(int64_t now_ms)
+{
+    if (now_ms < s_next_diag_ms) return;
+    s_next_diag_ms = now_ms + DIAG_PERIOD_MS;
+    ESP_LOGI(TAG,
+             "diag: heap_free=%u heap_min=%u heap_largest=%u stack_hwm=%u phase=%s",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+             (unsigned)uxTaskGetStackHighWaterMark(NULL), s_http_phase);
 }
 
 /* ---- main loop -------------------------------------------------------- */
@@ -253,6 +309,9 @@ static void worker_task(void *arg)
             switch (cmd.type) {
             case PANEL_CMD_OPEN_DETAIL:
                 open_detail(&cmd);
+                break;
+            case PANEL_CMD_CLOSE_DETAIL:
+                close_detail();
                 break;
             case PANEL_CMD_REFRESH:
             case PANEL_CMD_RECONNECT:
@@ -285,6 +344,9 @@ static void worker_task(void *arg)
         }
 
         check_delivered_timeout(now_ms);
+
+        flush_parked_event();
+        log_diagnostics(now_ms);
 
         vTaskDelay(pdMS_TO_TICKS(50));
     }

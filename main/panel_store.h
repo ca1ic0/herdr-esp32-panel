@@ -26,6 +26,7 @@ extern "C" {
 
 typedef enum {
     PANEL_CMD_OPEN_DETAIL = 1,
+    PANEL_CMD_CLOSE_DETAIL,         /* user left the detail screen */
     PANEL_CMD_REFRESH,
     PANEL_CMD_RECONNECT,
     PANEL_CMD_SET_DISPLAY_PREF,
@@ -73,11 +74,30 @@ void panel_store_set_conn(panel_conn_state_t st, const char *message);
 /** Copy current overview + connection for UI (lock held briefly). */
 void panel_store_get_overview(panel_overview_t *out, panel_conn_state_t *conn_out);
 
+/*
+ * Copy only the four cards of one overview page plus counts (lock held
+ * briefly). Preferred over panel_store_get_overview() on the UI task:
+ * avoids copying the full 24-card snapshot onto the LVGL stack.
+ * Returns the stored card count.
+ */
+int panel_store_get_page(panel_agent_card_t out4[4], int page,
+                         int *count_out, int *total_out,
+                         panel_conn_state_t *conn_out);
+
 /** Copy current detail (lock held briefly). Returns false if none. */
 bool panel_store_get_detail(panel_detail_t *out);
 
 /** Monotonic generation counter; UI redraws when it changes. */
 uint32_t panel_store_generation(void);
+
+/** Current connectivity state. */
+panel_conn_state_t panel_store_conn_state(void);
+
+/** Index of the first blocked card in the stored overview, or -1. */
+int panel_store_first_blocked_index(void);
+
+/** Number of blocked cards in the stored overview. */
+int panel_store_blocked_count(void);
 
 /* ---- queues ---------------------------------------------------------- */
 

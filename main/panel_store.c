@@ -96,6 +96,70 @@ uint32_t panel_store_generation(void)
     return s_generation;
 }
 
+int panel_store_get_page(panel_agent_card_t out4[4], int page,
+                         int *count_out, int *total_out,
+                         panel_conn_state_t *conn_out)
+{
+    if (out4 == NULL) return 0;
+    memset(out4, 0, 4 * sizeof(*out4));
+    if (s_lock == NULL) return 0;
+    int count = 0;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        count = s_overview.count;
+        for (int i = 0; i < 4; i++) {
+            int idx = page * 4 + i;
+            if (idx >= 0 && idx < s_overview.count) {
+                out4[i] = s_overview.agents[idx];
+            }
+        }
+        if (count_out != NULL) *count_out = s_overview.count;
+        if (total_out != NULL) *total_out = s_overview.total_count;
+        if (conn_out != NULL) *conn_out = s_conn;
+        xSemaphoreGive(s_lock);
+    }
+    return count;
+}
+
+panel_conn_state_t panel_store_conn_state(void)
+{
+    if (s_lock == NULL) return PANEL_CONN_WIFI_CONNECTING;
+    panel_conn_state_t st = PANEL_CONN_WIFI_CONNECTING;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        st = s_conn;
+        xSemaphoreGive(s_lock);
+    }
+    return st;
+}
+
+int panel_store_first_blocked_index(void)
+{
+    if (s_lock == NULL) return -1;
+    int found = -1;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        for (int i = 0; i < s_overview.count; i++) {
+            if (s_overview.agents[i].herdr_status == PANEL_AGENT_BLOCKED) {
+                found = i;
+                break;
+            }
+        }
+        xSemaphoreGive(s_lock);
+    }
+    return found;
+}
+
+int panel_store_blocked_count(void)
+{
+    if (s_lock == NULL) return 0;
+    int n = 0;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        for (int i = 0; i < s_overview.count; i++) {
+            if (s_overview.agents[i].herdr_status == PANEL_AGENT_BLOCKED) n++;
+        }
+        xSemaphoreGive(s_lock);
+    }
+    return n;
+}
+
 bool panel_store_enqueue_action(const panel_cmd_t *cmd)
 {
     if (cmd == NULL || s_action_q == NULL) return false;
@@ -124,15 +188,8 @@ bool panel_store_recv_control(panel_cmd_t *out, TickType_t wait)
 bool panel_store_post_ui_event(const panel_ui_evt_t *evt)
 {
     if (evt == NULL || s_ui_evt_q == NULL) return false;
-    /* Action results must not be dropped. */
-    if (evt->type == PANEL_EVT_ACTION_RESULT) {
-        for (int i = 0; i < 8; i++) {
-            if (xQueueSend(s_ui_evt_q, evt, pdMS_TO_TICKS(20)) == pdTRUE) {
-                return true;
-            }
-        }
-        return false;
-    }
+    /* Non-blocking only. Action results that do not fit are parked in the
+     * worker-local slot and re-posted later — never busy-wait here. */
     return xQueueSend(s_ui_evt_q, evt, 0) == pdTRUE;
 }
 

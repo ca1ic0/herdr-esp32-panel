@@ -38,9 +38,18 @@ components/              板级显示/触摸/电源与 LVGL 适配
 docs/                    目标规格与验收清单
 ```
 
-本地仓库目前没有 `refer/` 目录；主机网关代码需从实际部署仓库取得并核对接口版本。
+本地仓库目前没有 `refer/` 目录；主机网关实现位于相邻工程 `herdr-restful`（`backend/app/panel/`，见下节），接口版本变更需与本仓库 `panel_model.h` 同步核对。
 
 ## 主机 panel 网关
+
+网关代码在 `herdr-restful/backend/app/panel/`：FastAPI 路由 + 读模型聚合 + Claude/OpenCode/Pi 适配器 + HMAC 上下文令牌 + SQLite `request_id` 幂等表。启动前在主机生成设备令牌：
+
+```bash
+cd herdr-restful/backend
+python -m app.panel.tokens            # 生成一台设备的令牌
+export HERDR_RESTFUL_PANEL_TOKENS=hp_xxx   # 逗号分隔可配多台
+herdr-restful                          # 照常启动 REST 服务
+```
 
 设备对接的是网关契约，不是原始 Herdr REST：
 
@@ -78,7 +87,7 @@ idf.py -p PORT flash monitor
 
 - **A 硬件与文字骨架**：BSP 沿用，中文需补 CJK 字体资产（见 `ui_common.h`）。
 - **B 只读面板**：四宫格、详情和连接状态的固件代码已写入；0/1/4/5/24/25 会话仍需实机复核。
-- **C 网关决策（主机侧）**：本地仓库没有主机实现，不能从本仓库证明适配器、上下文令牌和去重已部署。
+- **C 网关决策（主机侧）**：`herdr-restful/backend/app/panel/` 已实现 overview/detail/actions、上下文令牌、终端锁与幂等去重，并有 12 个自动化测试；已对活 Herdr 0.9.0 验证只读路径（注意 herdr `agent.*` 方法参数是 `target`）。真实 CLI 审批端到端仍需验证。
 - **D 设备动作**：确认页、发送/回读状态机及结果未知处理的固件代码已写入；真实 CLI 端到端仍需验证。
 
 E（视觉/稳定性）、F（运行时设置）、G（Herdr 同款声音）与真实 CLI 适配器样本需在真机与实机主机上继续验收。当前固件**没有**声音播放和热设置功能；设置页目前只是静态卡片。**编译通过不等于产品完成。**

@@ -143,6 +143,7 @@ typedef struct {
     int64_t fetched_at_ms;
     uint32_t selection_epoch;
     bool valid;
+    bool gone;                      /* gateway 404: the session has ended */
 } panel_detail_t;
 
 /* ---- action command / result ----------------------------------------- */

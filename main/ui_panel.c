@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
@@ -71,7 +72,7 @@ static cell_t s_cells[4];
 
 static lv_obj_t *s_det_name, *s_det_status, *s_det_project, *s_det_updated;
 static lv_obj_t *s_det_content;
-static lv_obj_t *s_btn_allow, *s_btn_deny, *s_btn_continue, *s_btn_host;
+static lv_obj_t *s_btn_allow, *s_btn_deny, *s_btn_always, *s_btn_continue, *s_btn_host;
 static lv_obj_t *s_det_hint;
 
 static lv_obj_t *s_cnf_title, *s_cnf_body, *s_cnf_hint;
@@ -85,7 +86,6 @@ static lv_obj_t *s_prov_qr, *s_prov_info;
 
 /* ---- local view state -------------------------------------------------- */
 
-static panel_agent_card_t s_cards[PANEL_MAX_AGENTS];
 static int s_card_count;
 static int s_page;
 static screen_t s_screen = SCR_HOME;
@@ -106,6 +106,13 @@ static char s_prov_pass[12];
 static char s_prov_qr_text[128];
 
 static uint32_t s_seen_generation;
+static int s_last_age_sec = -1;
+static bool s_prev_fresh;
+
+static int64_t ui_now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
 
 /* ---- forward decls ----------------------------------------------------- */
 static void show_screen(screen_t s);
@@ -117,17 +124,13 @@ static void on_confirm_cancel(lv_event_t *e);
 static void on_confirm_ok(lv_event_t *e);
 static void on_result_back(lv_event_t *e);
 static void on_refresh(lv_event_t *e);
+static void on_jump_blocked(lv_event_t *e);
 
 /* ---- helpers ----------------------------------------------------------- */
 
 static void bump_epoch(void)
 {
     s_sel_epoch++;
-}
-
-static bool selection_matches(const char *term, uint32_t epoch)
-{
-    return strcmp(s_sel_term, term) == 0 && s_sel_epoch == epoch;
 }
 
 static const char *shape_symbol(panel_agent_state_t st)
@@ -181,7 +184,7 @@ static void build_home(void)
 
     s_pending_count = ui_label(s_home, 260, 24, 140, "Blocked 0", 20, COLOR_PENDING);
     lv_obj_add_flag(s_pending_count, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_pending_count, on_refresh, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_pending_count, on_jump_blocked, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *menu = ui_button(s_home, 400, 12, 64, 48, LV_SYMBOL_SETTINGS, COLOR_CARD, 20);
     lv_obj_add_event_cb(menu, on_menu, LV_EVENT_CLICKED, NULL);
@@ -278,31 +281,26 @@ static void fill_cell(int slot, const panel_agent_card_t *a)
     snprintf(c->terminal_id, sizeof(c->terminal_id), "%s", a->terminal_id);
 }
 
-static void refresh_home(const panel_overview_t *ov, panel_conn_state_t conn)
+static void refresh_home(const panel_agent_card_t cards[4], int count,
+                         int total, panel_conn_state_t conn)
 {
     lv_label_set_text(s_conn_badge, panel_conn_state_name(conn));
     lv_obj_set_style_text_color(s_conn_badge,
         lv_color_hex(conn == PANEL_CONN_ONLINE ? COLOR_IDLE : COLOR_PENDING), 0);
 
-    int blocked_n = 0;
-    for (int i = 0; i < ov->count; i++) {
-        if (ov->agents[i].herdr_status == PANEL_AGENT_BLOCKED) blocked_n++;
-    }
     char buf[48];
-    snprintf(buf, sizeof(buf), "Blocked %d", blocked_n);
+    snprintf(buf, sizeof(buf), "Blocked %d", panel_store_blocked_count());
     lv_label_set_text(s_pending_count, buf);
 
-    int pages = (ov->count + PAGE_SIZE - 1) / PAGE_SIZE;
+    int pages = (count + PAGE_SIZE - 1) / PAGE_SIZE;
     if (pages < 1) pages = 1;
-    if (s_page >= pages) s_page = pages - 1;
-    if (s_page < 0) s_page = 0;
 
     snprintf(buf, sizeof(buf), "Page %d/%d", s_page + 1, pages);
     lv_label_set_text(s_page_label, buf);
-    snprintf(buf, sizeof(buf), "Total %d", ov->count);
+    snprintf(buf, sizeof(buf), "Total %d", total);
     lv_label_set_text(s_total_label, buf);
 
-    if (ov->count == 0) {
+    if (count == 0) {
         lv_obj_clear_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
         for (int i = 0; i < 4; i++) {
             lv_obj_add_flag(s_cells[i].card, LV_OBJ_FLAG_HIDDEN);
@@ -312,10 +310,9 @@ static void refresh_home(const panel_overview_t *ov, panel_conn_state_t conn)
     lv_obj_add_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
 
     for (int i = 0; i < 4; i++) {
-        int idx = s_page * PAGE_SIZE + i;
         lv_obj_clear_flag(s_cells[i].card, LV_OBJ_FLAG_HIDDEN);
-        if (idx < ov->count) {
-            fill_cell(i, &ov->agents[idx]);
+        if (cards[i].terminal_id[0] != '\0') {
+            fill_cell(i, &cards[i]);
         } else {
             fill_cell(i, NULL);
         }
@@ -352,25 +349,47 @@ static void build_detail(void)
     lv_obj_set_style_border_width(s_det_content, 1, 0);
     lv_obj_set_style_pad_all(s_det_content, 12, 0);
 
-    /* action area: 16,332,448,88 — up to 2 buttons */
+    /* action area: 16,332,448,88 — 2 buttons, or 3 when allow_always exists */
     s_btn_allow = ui_button(s_detail, 16, 332, 220, 88, "Allow once", COLOR_DONE, 22);
     s_btn_deny = ui_button(s_detail, 244, 332, 220, 88, "Deny", COLOR_PENDING, 22);
+    s_btn_always = ui_button(s_detail, 324, 332, 140, 88, "Always", COLOR_WORKING, 18);
     s_btn_continue = ui_button(s_detail, 16, 332, 448, 88, "Continue", COLOR_ACCENT, 22);
     s_btn_host = ui_button(s_detail, 16, 332, 448, 88, "Use host terminal", COLOR_BORDER, 20);
     lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_btn_allow, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_ALLOW_ONCE);
     lv_obj_add_event_cb(s_btn_deny, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_DENY);
+    lv_obj_add_event_cb(s_btn_always, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_ALLOW_ALWAYS);
     lv_obj_add_event_cb(s_btn_continue, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_CONTINUE);
     lv_obj_add_event_cb(s_btn_host, on_refresh, LV_EVENT_CLICKED, NULL);
 
     s_det_hint = ui_label(s_detail, 16, 432, 448, "Confirm after action", 18, COLOR_DIM);
 }
 
-static void render_detail(const panel_detail_t *det, panel_conn_state_t conn)
+static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
+                          int age_s)
 {
+    if (det->gone) {
+        lv_label_set_text(s_det_name, det->terminal_id);
+        lv_label_set_text(s_det_status, "Ended");
+        lv_obj_set_style_text_color(s_det_status, lv_color_hex(COLOR_UNKNOWN), 0);
+        lv_label_set_text(s_det_project, "");
+        lv_label_set_text(s_det_updated, "");
+        lv_obj_clean(s_det_content);
+        ui_label(s_det_content, 0, 60, 424, "Session ended — back to list",
+                 18, COLOR_DISABLED);
+        lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_det_hint, "Session ended");
+        return;
+    }
+
     lv_label_set_text(s_det_name, det->agent[0] ? det->agent : det->terminal_id);
 
     uint32_t col = panel_agent_state_color(det->herdr_status);
@@ -379,13 +398,15 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn)
 
     lv_label_set_text(s_det_project, det->pane_id);
 
-    int age_s = 0;
-    if (det->fetched_at_ms > 0) {
-        /* monotonic age is computed in the tick from a shared clock */
-    }
     char ubuf[48];
-    snprintf(ubuf, sizeof(ubuf), "Updated %d s ago", age_s);
+    if (age_s > 6) {
+        snprintf(ubuf, sizeof(ubuf), "Stale %d s", age_s);
+    } else {
+        snprintf(ubuf, sizeof(ubuf), "Updated %d s ago", age_s);
+    }
     lv_label_set_text(s_det_updated, ubuf);
+    lv_obj_set_style_text_color(s_det_updated,
+        lv_color_hex(age_s > 6 ? COLOR_PENDING : COLOR_DISABLED), 0);
 
     /* content: pending card first, else output lines */
     lv_obj_clean(s_det_content);
@@ -433,13 +454,15 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn)
         }
     }
 
-    /* action visibility from gateway choices only */
+    /* action visibility from gateway choices only; actions need fresh data:
+     * spec §4.3 — >6 s marks stale, >10 s disables actions entirely */
     bool online = (conn == PANEL_CONN_ONLINE);
-    bool fresh = det->valid && online;
+    bool fresh = det->valid && online && age_s <= 10;
     uint8_t choices = fresh ? det->pending.choices : 0;
 
     lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
 
@@ -450,20 +473,37 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn)
         return;
     }
 
+    if (online && age_s > 10) {
+        lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Data too old");
+        lv_label_set_text(s_det_hint, "Refreshing; actions disabled");
+        return;
+    }
+
     if (det->pending.kind == PANEL_PENDING_APPROVAL ||
         det->pending.kind == PANEL_PENDING_QUESTION) {
         bool has_allow = (choices & PANEL_CHOICE_ALLOW_ONCE) != 0;
+        bool has_always = (choices & PANEL_CHOICE_ALLOW_ALWAYS) != 0;
         bool has_deny = (choices & PANEL_CHOICE_DENY) != 0;
-        if (has_allow && has_deny) {
+        if (has_allow && has_deny && has_always) {
+            /* 3-button layout: 146 / 146 / 140 */
+            lv_obj_set_pos(s_btn_allow, 16, 332);
+            lv_obj_set_size(s_btn_allow, 146, 88);
+            lv_obj_set_pos(s_btn_deny, 170, 332);
+            lv_obj_set_size(s_btn_deny, 146, 88);
             lv_obj_clear_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(s_det_hint, "Confirm after action");
-        } else if (has_allow) {
-            lv_obj_clear_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(s_det_hint, "Confirm after action");
-        } else if (has_deny) {
-            lv_obj_clear_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(s_det_hint, "Confirm after action");
+            lv_obj_clear_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_det_hint, "Always needs strong confirm");
+        } else if (has_allow || has_deny) {
+            /* 2-button layout */
+            lv_obj_set_pos(s_btn_allow, 16, 332);
+            lv_obj_set_size(s_btn_allow, 220, 88);
+            lv_obj_set_pos(s_btn_deny, 244, 332);
+            lv_obj_set_size(s_btn_deny, 220, 88);
+            if (has_allow) lv_obj_clear_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
+            if (has_deny) lv_obj_clear_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s_det_hint, age_s > 6 ? "Data stale" : "Confirm after action");
         } else {
             lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
             lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "Use host terminal");
@@ -473,7 +513,7 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn)
                 det->herdr_status == PANEL_AGENT_DONE) &&
                (choices & PANEL_CHOICE_CONTINUE)) {
         lv_obj_clear_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_det_hint, "Confirm shows full prompt");
+        lv_label_set_text(s_det_hint, age_s > 6 ? "Data stale" : "Confirm shows full prompt");
     } else if (det->pending.kind == PANEL_PENDING_UNRECOGNIZED ||
                det->herdr_status == PANEL_AGENT_BLOCKED) {
         lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
@@ -654,7 +694,7 @@ static void build_settings(void)
     lv_obj_add_event_cb(re, on_menu, LV_EVENT_CLICKED, (void *)(intptr_t)3);
 }
 
-static void refresh_settings(const panel_overview_t *ov, panel_conn_state_t conn)
+static void refresh_settings(int session_count, panel_conn_state_t conn)
 {
     app_config_t cfg;
     app_config_get(&cfg);
@@ -670,7 +710,7 @@ static void refresh_settings(const panel_overview_t *ov, panel_conn_state_t conn
              s_brightness, s_reduce_motion ? "On" : "Off");
     lv_label_set_text(lv_obj_get_child(s_set_display, 1), buf);
 
-    snprintf(buf, sizeof(buf), "FW v0.2 · Proto v1 · Sessions %d", ov->count);
+    snprintf(buf, sizeof(buf), "FW v0.2 · Proto v1 · Sessions %d", session_count);
     lv_label_set_text(lv_obj_get_child(s_set_about, 1), buf);
 }
 
@@ -770,6 +810,21 @@ static void on_card(lv_event_t *e)
         /* queue full: non-blocking, show busy */
         return;
     }
+
+    /* don't show the previous session's content while this one loads */
+    lv_label_set_text(s_det_name, term);
+    lv_label_set_text(s_det_status, "");
+    lv_label_set_text(s_det_project, "");
+    lv_label_set_text(s_det_updated, "");
+    lv_label_set_text(s_det_hint, "");
+    lv_obj_clean(s_det_content);
+    ui_label(s_det_content, 0, 60, 424, "Loading...", 18, COLOR_DISABLED);
+    lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+
     show_screen(SCR_DETAIL);
 }
 
@@ -783,10 +838,7 @@ static void on_menu(lv_event_t *e)
         return;
     }
     if (s_screen == SCR_HOME) {
-        panel_overview_t ov;
-        panel_conn_state_t conn;
-        panel_store_get_overview(&ov, &conn);
-        refresh_settings(&ov, conn);
+        refresh_settings(s_card_count, panel_store_conn_state());
         show_screen(SCR_SETTINGS);
     }
 }
@@ -797,19 +849,28 @@ static void on_back(lv_event_t *e)
     intptr_t code = (intptr_t)ud;
 
     if (code == 100) { /* prev page */
-        if (s_page > 0) s_page--;
+        if (s_page > 0) {
+            s_page--;
+            s_seen_generation = 0;  /* force redraw on next tick */
+        }
         return;
     }
     if (code == 101) { /* next page */
         int pages = (s_card_count + PAGE_SIZE - 1) / PAGE_SIZE;
         if (pages < 1) pages = 1;
-        if (s_page < pages - 1) s_page++;
+        if (s_page < pages - 1) {
+            s_page++;
+            s_seen_generation = 0;  /* force redraw on next tick */
+        }
         return;
     }
 
     if (s_screen == SCR_DETAIL) {
         bump_epoch();
         s_sel_term[0] = '\0';
+        /* tell the worker to stop polling this detail */
+        panel_cmd_t cmd = { .type = PANEL_CMD_CLOSE_DETAIL };
+        panel_store_enqueue_control(&cmd);
         show_screen(SCR_HOME);
     } else if (s_screen == SCR_SETTINGS || s_screen == SCR_RESULT) {
         show_screen(SCR_HOME);
@@ -826,15 +887,25 @@ static void on_refresh(lv_event_t *e)
     panel_store_enqueue_control(&cmd);
 }
 
+static void on_jump_blocked(lv_event_t *e)
+{
+    (void)e;
+    /* spec §2.2: tapping the blocked count jumps to the first blocked card */
+    int idx = panel_store_first_blocked_index();
+    if (idx >= 0) {
+        s_page = idx / PAGE_SIZE;
+        s_seen_generation = 0;  /* force redraw on next tick */
+    }
+}
+
 static void on_action_btn(lv_event_t *e)
 {
     panel_action_id_t act = (panel_action_id_t)(intptr_t)lv_event_get_user_data(e);
     panel_detail_t det;
     if (!panel_store_get_detail(&det)) return;
-    if (!selection_matches(det.terminal_id, det.selection_epoch) &&
-        strcmp(s_sel_term, det.terminal_id) != 0) {
-        return;
-    }
+    /* the stored detail must still be the session the user is looking at;
+     * the worker already discards responses with a stale selection epoch */
+    if (strcmp(det.terminal_id, s_sel_term) != 0) return;
     /* freeze card; confirm page shows impact */
     show_confirm(act, &det);
 }
@@ -934,24 +1005,67 @@ void ui_panel_tick(void)
 
     /* 2. redraw when store generation changed */
     uint32_t gen = panel_store_generation();
-    if (gen == s_seen_generation) return;
+    bool gen_changed = (gen != s_seen_generation);
     s_seen_generation = gen;
 
-    panel_overview_t ov;
-    panel_conn_state_t conn;
-    panel_store_get_overview(&ov, &conn);
-    s_card_count = ov.count;
+    if (s_screen == SCR_HOME || s_screen == SCR_SETTINGS) {
+        if (!gen_changed) return;
 
-    if (s_screen == SCR_HOME) {
-        refresh_home(&ov, conn);
-    } else if (s_screen == SCR_DETAIL) {
-        panel_detail_t det;
-        if (panel_store_get_detail(&det)) {
-            if (strcmp(det.terminal_id, s_sel_term) == 0) {
-                render_detail(&det, conn);
-            }
+        panel_agent_card_t cards[4];
+        int count = 0, total = 0;
+        panel_conn_state_t conn;
+        panel_store_get_page(cards, s_page, &count, &total, &conn);
+        s_card_count = count;
+
+        /* clamp the page when the list shrank, then refetch that page */
+        int pages = (count + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (pages < 1) pages = 1;
+        if (s_page >= pages) {
+            s_page = pages - 1;
+            panel_store_get_page(cards, s_page, &count, &total, &conn);
         }
-    } else if (s_screen == SCR_SETTINGS) {
-        refresh_settings(&ov, conn);
+        if (s_page < 0) s_page = 0;
+
+        if (s_screen == SCR_HOME) {
+            refresh_home(cards, count, total, conn);
+        } else {
+            refresh_settings(count, conn);
+        }
+        return;
+    }
+
+    if (s_screen != SCR_DETAIL) return;
+
+    /* detail: refresh age display every second and re-render when either
+     * the store changed or the freshness category flipped (spec §4.3) */
+    panel_detail_t det;
+    if (!panel_store_get_detail(&det)) return;
+    if (strcmp(det.terminal_id, s_sel_term) != 0) return;
+
+    panel_conn_state_t conn = panel_store_conn_state();
+
+    int age_s = det.fetched_at_ms > 0
+                    ? (int)((ui_now_ms() - det.fetched_at_ms) / 1000)
+                    : 0;
+    if (age_s < 0) age_s = 0;
+
+    bool fresh = conn == PANEL_CONN_ONLINE && age_s <= 10;
+    bool stale_flag = age_s > 6;
+    bool category_flip = fresh != s_prev_fresh || stale_flag != (s_last_age_sec > 6);
+
+    if (gen_changed || category_flip) {
+        s_prev_fresh = fresh;
+        s_last_age_sec = age_s;
+        render_detail(&det, conn, age_s);
+    } else if (age_s != s_last_age_sec) {
+        /* cheap path: update only the age label */
+        s_last_age_sec = age_s;
+        char ubuf[48];
+        if (stale_flag) {
+            snprintf(ubuf, sizeof(ubuf), "Stale %d s", age_s);
+        } else {
+            snprintf(ubuf, sizeof(ubuf), "Updated %d s ago", age_s);
+        }
+        lv_label_set_text(s_det_updated, ubuf);
     }
 }

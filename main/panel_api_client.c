@@ -27,9 +27,14 @@ typedef struct {
     bool overflow;
 } resp_buf_t;
 
+/* Single-owner worker task: the active response buffer and the persistent
+ * client handle are file-scope and never touched from other tasks. */
+static resp_buf_t *s_rb;
+static esp_http_client_handle_t s_client;
+
 static esp_err_t http_event(esp_http_client_event_t *evt)
 {
-    resp_buf_t *rb = (resp_buf_t *)evt->user_data;
+    resp_buf_t *rb = s_rb;
     if (evt->event_id == HTTP_EVENT_ON_DATA && rb != NULL && evt->data_len > 0) {
         size_t add = (size_t)evt->data_len;
         if (rb->len + add >= rb->cap) {
@@ -48,6 +53,7 @@ static panel_http_result_t map_transport(esp_err_t err, int status, bool overflo
     if (overflow) return PANEL_HTTP_TOO_LARGE;
     if (err != ESP_OK) return (status == 0) ? PANEL_HTTP_OFFLINE : PANEL_HTTP_ERR;
     if (status == 401 || status == 403) return PANEL_HTTP_AUTH;
+    if (status == 404) return PANEL_HTTP_GONE;
     if (status == 409) return PANEL_HTTP_STALE; /* refined by body later */
     if (status == 422) return PANEL_HTTP_UNSUPPORTED;
     if (status == 503) return PANEL_HTTP_OFFLINE;
@@ -56,9 +62,19 @@ static panel_http_result_t map_transport(esp_err_t err, int status, bool overflo
 }
 
 /*
- * Perform one request. `resp`/`resp_cap` must be a static/worker buffer.
- * timeout_ms: 2000 for reads, 5000 for actions (architecture §5.3).
+ * Perform one request on the persistent client handle (architecture §5.3:
+ * one owner task, serialised requests, connection reused across polls).
+ * `resp`/`resp_cap` must be a static/worker buffer.
+ * timeout_ms: 2000 for reads, 5000 for actions.
  */
+static void drop_client(void)
+{
+    if (s_client != NULL) {
+        esp_http_client_cleanup(s_client);
+        s_client = NULL;
+    }
+}
+
 static panel_http_result_t http_request(esp_http_client_method_t method,
                                         const char *path,
                                         const char *body,
@@ -74,38 +90,41 @@ static panel_http_result_t http_request(esp_http_client_method_t method,
 
     resp_buf_t rb = { .buf = resp, .len = 0, .cap = resp_cap, .overflow = false };
     if (resp != NULL && resp_cap > 0) resp[0] = '\0';
+    s_rb = &rb;
+
+    if (s_client == NULL) {
+        esp_http_client_config_t cfg = {
+            .url = url,
+            .event_handler = http_event,
+            .buffer_size = 2048,
+            .timeout_ms = timeout_ms,
+        };
+        s_client = esp_http_client_init(&cfg);
+        if (s_client == NULL) return PANEL_HTTP_ERR;
+    } else {
+        esp_http_client_set_url(s_client, url);
+        esp_http_client_set_timeout_ms(s_client, timeout_ms);
+    }
+    esp_http_client_set_method(s_client, method);
 
     char auth[128];
     app_config_auth_header(auth, sizeof(auth));
-
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .method = method,
-        .event_handler = http_event,
-        .user_data = &rb,
-        .timeout_ms = timeout_ms,
-        .buffer_size = 2048,
-    };
-
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (client == NULL) return PANEL_HTTP_ERR;
-
     if (auth[0] != '\0') {
-        esp_http_client_set_header(client, "Authorization", auth);
+        esp_http_client_set_header(s_client, "Authorization", auth);
     }
     if (body != NULL) {
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        esp_http_client_set_post_field(client, body, (int)strlen(body));
+        esp_http_client_set_header(s_client, "Content-Type", "application/json");
+        esp_http_client_set_post_field(s_client, body, (int)strlen(body));
     }
 
-    esp_err_t err = esp_http_client_perform(client);
-    int status = esp_http_client_get_status_code(client);
+    esp_err_t err = esp_http_client_perform(s_client);
+    int status = esp_http_client_get_status_code(s_client);
     if (status_out != NULL) *status_out = status;
-    esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "%s %s -> %s (HTTP %d)", esp_err_to_name(err), path,
-                 esp_err_to_name(err), status);
+        ESP_LOGW(TAG, "%s %s -> HTTP %d", esp_err_to_name(err), path, status);
+        /* broken connection: rebuild the handle next request */
+        drop_client();
     }
     return map_transport(err, status, rb.overflow);
 }

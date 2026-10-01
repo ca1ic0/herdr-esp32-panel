@@ -31,6 +31,7 @@ typedef enum {
     PANEL_HTTP_UNSUPPORTED,     /* 422 */
     PANEL_HTTP_OFFLINE,         /* 503 */
     PANEL_HTTP_PROTO,           /* schema_version / malformed */
+    PANEL_HTTP_GONE,            /* 404 — session ended */
     PANEL_HTTP_TOO_LARGE,
     PANEL_HTTP_TIMEOUT,
     PANEL_HTTP_ERR,             /* other network / 5xx */
