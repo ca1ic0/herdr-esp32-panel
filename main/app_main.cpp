@@ -25,6 +25,7 @@
 #include "app_config.h"
 #include "panel_display.h"
 #include "panel_audio.h"
+#include "panel_power.h"
 #include "panel_prefs.h"
 #include "panel_store.h"
 #include "panel_worker.h"
@@ -36,6 +37,38 @@ static const char *TAG = "herdr_panel";
 
 I2cMasterBus user_i2cbus(BSP_I2C_SCL, BSP_I2C_SDA, BSP_I2C_NUM);
 DisplayPort *user_display = NULL;
+static portMUX_TYPE s_power_lock = portMUX_INITIALIZER_UNLOCKED;
+static panel_power_status_t s_power_status = { false, false, false, -1, 0 };
+static bool s_power_valid;
+
+extern "C" bool panel_power_get(panel_power_status_t *out)
+{
+    if (out == nullptr) return false;
+    portENTER_CRITICAL(&s_power_lock);
+    *out = s_power_status;
+    bool valid = s_power_valid;
+    portEXIT_CRITICAL(&s_power_lock);
+    return valid;
+}
+
+static void power_sample_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        PmicBatteryStatus sample;
+        if (Custom_PmicReadBattery(&sample)) {
+            portENTER_CRITICAL(&s_power_lock);
+            s_power_status.battery_present = sample.battery_present;
+            s_power_status.external_power = sample.external_power;
+            s_power_status.charging = sample.charging;
+            s_power_status.percent = sample.percent;
+            s_power_status.millivolts = sample.millivolts;
+            s_power_valid = true;
+            portEXIT_CRITICAL(&s_power_lock);
+        }
+        vTaskDelay(pdMS_TO_TICKS(15000));
+    }
+}
 
 extern "C" void panel_display_set_brightness(uint8_t percent)
 {
@@ -77,9 +110,18 @@ extern "C" void app_main(void)
 
     /* LVGL port (display + touch) */
     Lvgl_PortInit(*user_display);
+    xTaskCreatePinnedToCore(power_sample_task, "power_sample", 3072,
+                            NULL, 3, NULL, 0);
 
-    /* config_service owns NVS; wifi_connect relies on that single init */
+    /* Bring up the splash before network and codec startup so it animates
+     * while those subsystems initialise. LVGL remains owned by its task. */
     panel_store_init();
+    if (Lvgl_lock(-1) == ESP_OK) {
+        ui_panel_init();
+        lv_timer_create(ui_tick_cb, 200, NULL);
+        Lvgl_unlock();
+    }
+
     if (!panel_audio_start(user_i2cbus.Get_I2cBusHandle())) {
         ESP_LOGW(TAG, "audio task unavailable; visual alerts remain active");
     }
@@ -91,7 +133,6 @@ extern "C" void app_main(void)
     }
 
     if (Lvgl_lock(-1) == ESP_OK) {
-        ui_panel_init();
         if (provisioning_active()) {
             char ap_ssid[24];
             char ap_pass[12];
@@ -101,7 +142,7 @@ extern "C" void app_main(void)
             provisioning_get_qr_payload(qr, sizeof(qr));
             ui_show_provisioning(ap_ssid, ap_pass, qr);
         }
-        lv_timer_create(ui_tick_cb, 200, NULL);
+        ui_panel_boot_ready();
         Lvgl_unlock();
     }
 

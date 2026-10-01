@@ -3,7 +3,7 @@
 /*
  * LVGL UI for the Herdr panel (UI_DESIGN.md).
  *
- * Screens: HOM 4-grid, DET detail, CNF confirm, RST result, SET settings,
+ * Screens: BOOT splash, HOM 4-grid, DET detail, CNF confirm, RST result, SET settings,
  *          PRV provisioning QR.
  *
  * Selection identity is terminal_id + selection_epoch (never array index).
@@ -28,6 +28,9 @@ void ui_panel_tick(void);
 
 /** Show the provisioning (QR code) screen. */
 void ui_show_provisioning(const char *ap_ssid, const char *ap_pass, const char *qr_payload);
+
+/** Release splash after the boot target (home or provisioning) is known. */
+void ui_panel_boot_ready(void);
 
 #ifdef __cplusplus
 }

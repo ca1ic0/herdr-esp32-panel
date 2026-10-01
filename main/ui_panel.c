@@ -31,6 +31,7 @@
 #include "panel_prefs.h"
 #include "panel_display.h"
 #include "panel_audio.h"
+#include "panel_power.h"
 #include "ui_common.h"
 
 #define SCREEN_W     480
@@ -47,7 +48,8 @@ static const struct { int x, y, w, h; } CARD_POS[4] = {
 #define PAGE_SIZE    4
 
 typedef enum {
-    SCR_HOME = 0,
+    SCR_BOOT = 0,
+    SCR_HOME,
     SCR_DETAIL,
     SCR_CONFIRM,
     SCR_RESULT,
@@ -80,11 +82,13 @@ typedef struct {
 
 /* ---- widget handles --------------------------------------------------- */
 
-static lv_obj_t *s_home, *s_detail, *s_confirm, *s_result, *s_settings, *s_prov;
+static lv_obj_t *s_boot, *s_home, *s_detail, *s_confirm, *s_result, *s_settings, *s_prov;
+static lv_obj_t *s_boot_cells[4], *s_boot_progress;
 static lv_obj_t *s_quick, *s_sound, *s_sound_more, *s_quiet;
 static lv_obj_t *s_display, *s_sessions, *s_connection, *s_about, *s_reprovision;
 
 static lv_obj_t *s_conn_badge, *s_pending_count, *s_page_label, *s_total_label;
+static lv_obj_t *s_battery_label, *s_battery_fill, *s_connection_power;
 static lv_obj_t *s_sound_notice;
 static lv_obj_t *s_empty_label;
 static cell_t s_cells[4];
@@ -127,6 +131,9 @@ static panel_action_id_t s_pending_action;
 static panel_pending_t s_frozen_pending;
 static int64_t s_confirm_started_ms;
 static bool s_dimmed;
+static int64_t s_boot_started_ms;
+static bool s_boot_provision;
+static bool s_boot_ready;
 
 static uint32_t s_edit_id;
 
@@ -146,6 +153,7 @@ static int64_t ui_now_ms(void)
 
 /* ---- forward decls ----------------------------------------------------- */
 static void show_screen(screen_t s);
+static void show_provision_screen(const char *ssid, const char *pass, const char *qr);
 static void on_card(lv_event_t *e);
 static void on_menu(lv_event_t *e);
 static void on_back(lv_event_t *e);
@@ -161,6 +169,63 @@ static void on_pref_click(lv_event_t *e);
 static void on_pref_slider(lv_event_t *e);
 static void on_settings_nav(lv_event_t *e);
 static void on_sound_test(lv_event_t *e);
+
+static void refresh_power_ui(void)
+{
+    panel_power_status_t p;
+    bool valid = panel_power_get(&p);
+    char short_text[20];
+    char detail[96];
+    int percent = valid && p.battery_present ? p.percent : -1;
+    if (!valid) {
+        snprintf(short_text, sizeof(short_text), "%s", "--%");
+        snprintf(detail, sizeof(detail), "%s", "电量：读取中");
+    } else if (!p.battery_present) {
+        snprintf(short_text, sizeof(short_text), "%s", p.external_power ? "USB" : "--%");
+        snprintf(detail, sizeof(detail), "%s", p.external_power ?
+                 "电池未连接 · USB 供电" : "电池状态不可用");
+    } else if (percent < 0) {
+        snprintf(short_text, sizeof(short_text), "%s", "--%");
+        snprintf(detail, sizeof(detail), "%s", "电量暂不可读");
+    } else {
+        if (p.charging) snprintf(short_text, sizeof(short_text), "充%d%%", percent);
+        else snprintf(short_text, sizeof(short_text), "%d%%", percent);
+        snprintf(detail, sizeof(detail), "电量：%d%% · %s%s",
+                 percent, p.charging ? "充电中" :
+                 p.external_power ? "外接电源" : "电池供电",
+                 p.millivolts > 0 ? "" : " · 电压未知");
+    }
+    static char last_text[20];
+    static char last_detail[96];
+    static int last_percent = -2;
+    static bool last_charging;
+    if (strcmp(short_text, last_text) == 0 &&
+        strcmp(detail, last_detail) == 0 &&
+        percent == last_percent &&
+        (!valid || p.charging == last_charging)) return;
+    snprintf(last_text, sizeof(last_text), "%s", short_text);
+    snprintf(last_detail, sizeof(last_detail), "%s", detail);
+    last_percent = percent;
+    last_charging = valid && p.charging;
+    if (s_battery_label) {
+        lv_label_set_text(s_battery_label, short_text);
+        lv_obj_set_style_text_color(s_battery_label,
+            lv_color_hex(percent >= 0 && percent <= 15 && !p.charging ?
+                         COLOR_PENDING : COLOR_DIM), 0);
+    }
+    if (s_battery_fill) {
+        if (percent < 0) lv_obj_add_flag(s_battery_fill, LV_OBJ_FLAG_HIDDEN);
+        else {
+            lv_obj_clear_flag(s_battery_fill, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_width(s_battery_fill, percent > 0 ?
+                             (percent * 56 + 99) / 100 : 1);
+            lv_obj_set_style_bg_color(s_battery_fill,
+                lv_color_hex(percent <= 15 && !p.charging ?
+                             COLOR_PENDING : p.charging ? COLOR_IDLE : COLOR_ACCENT), 0);
+        }
+    }
+    if (s_connection_power) lv_label_set_text(s_connection_power, detail);
+}
 
 /* ---- 8-bit style agent icons (16x16 1bpp pixel maps) -------------------- */
 
@@ -356,6 +421,66 @@ static lv_obj_t *make_screen(void)
     return scr;
 }
 
+static void build_boot(void)
+{
+    s_boot = make_screen();
+    lv_obj_t *brand = ui_label(s_boot, 40, 98, 400, "HERDR", 28, COLOR_TEXT);
+    lv_obj_set_style_text_align(brand, LV_TEXT_ALIGN_CENTER, 0);
+    for (int i = 0; i < 4; i++) {
+        s_boot_cells[i] = lv_obj_create(s_boot);
+        lv_obj_set_pos(s_boot_cells[i], 204 + (i % 2) * 40,
+                       177 + (i / 2) * 40);
+        lv_obj_set_size(s_boot_cells[i], 28, 28);
+        lv_obj_set_style_radius(s_boot_cells[i], 7, 0);
+        lv_obj_set_style_bg_color(s_boot_cells[i], lv_color_hex(COLOR_BORDER), 0);
+        lv_obj_set_style_bg_opa(s_boot_cells[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(s_boot_cells[i], 0, 0);
+        lv_obj_clear_flag(s_boot_cells[i], LV_OBJ_FLAG_SCROLLABLE);
+    }
+    lv_obj_t *subtitle = ui_label(s_boot, 40, 284, 400,
+                                  "连接你的 Herdr 会话", 20, COLOR_DIM);
+    lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *track = lv_obj_create(s_boot);
+    lv_obj_set_pos(track, 140, 346);
+    lv_obj_set_size(track, 200, 4);
+    lv_obj_set_style_bg_color(track, lv_color_hex(COLOR_BORDER), 0);
+    lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(track, 0, 0);
+    lv_obj_set_style_pad_all(track, 0, 0);
+    lv_obj_clear_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+    s_boot_progress = lv_obj_create(track);
+    lv_obj_set_pos(s_boot_progress, 0, 0);
+    lv_obj_set_size(s_boot_progress, 1, 4);
+    lv_obj_set_style_bg_color(s_boot_progress, lv_color_hex(COLOR_ACCENT), 0);
+    lv_obj_set_style_bg_opa(s_boot_progress, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_boot_progress, 0, 0);
+    lv_obj_set_style_pad_all(s_boot_progress, 0, 0);
+}
+
+static void tick_boot(void)
+{
+    panel_prefs_t p;
+    panel_prefs_get(&p);
+    int64_t elapsed = ui_now_ms() - s_boot_started_ms;
+    int duration = p.reduce_motion ? 400 : 1200;
+    if (elapsed >= duration && s_boot_ready) {
+        if (s_boot_provision)
+            show_screen(SCR_PROVISION);
+        else
+            show_screen(SCR_HOME);
+        return;
+    }
+    int lit = p.reduce_motion ? 4 : (int)(elapsed * 4 / 900);
+    if (lit > 4) lit = 4;
+    for (int i = 0; i < 4; i++) {
+        lv_obj_set_style_bg_color(s_boot_cells[i],
+            lv_color_hex(i < lit ? COLOR_ACCENT : COLOR_BORDER), 0);
+    }
+    int progress = elapsed >= duration ? 200 :
+                   p.reduce_motion ? 200 : 1 + (int)(elapsed * 199 / duration);
+    lv_obj_set_width(s_boot_progress, progress);
+}
+
 /* ====================================================================== */
 /* HOM                                                                     */
 /* ====================================================================== */
@@ -367,11 +492,30 @@ static void build_home(void)
     /* top bar: HERDR | blocked N | menu */
     ui_label(s_home, 16, 20, 100, "HERDR", 24, COLOR_TEXT);
 
-    s_conn_badge = ui_label(s_home, 120, 28, 140, "", 18, COLOR_UNKNOWN);
+    s_conn_badge = ui_label(s_home, 116, 28, 116, "", 18, COLOR_UNKNOWN);
 
-    s_pending_count = ui_label(s_home, 260, 24, 140, "待处理 0", 20, COLOR_PENDING);
+    s_pending_count = ui_label(s_home, 236, 24, 102, "待处理 0", 18, COLOR_PENDING);
     lv_obj_add_flag(s_pending_count, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_pending_count, on_jump_blocked, LV_EVENT_CLICKED, NULL);
+
+    s_battery_label = ui_label(s_home, 340, 22, 56, "--%", 14, COLOR_DIM);
+    lv_obj_set_style_text_align(s_battery_label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_t *battery_track = lv_obj_create(s_home);
+    lv_obj_set_pos(battery_track, 340, 49);
+    lv_obj_set_size(battery_track, 56, 4);
+    lv_obj_set_style_bg_color(battery_track, lv_color_hex(COLOR_BORDER), 0);
+    lv_obj_set_style_bg_opa(battery_track, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(battery_track, 0, 0);
+    lv_obj_set_style_pad_all(battery_track, 0, 0);
+    lv_obj_clear_flag(battery_track, LV_OBJ_FLAG_SCROLLABLE);
+    s_battery_fill = lv_obj_create(battery_track);
+    lv_obj_set_pos(s_battery_fill, 0, 0);
+    lv_obj_set_size(s_battery_fill, 1, 4);
+    lv_obj_set_style_bg_color(s_battery_fill, lv_color_hex(COLOR_ACCENT), 0);
+    lv_obj_set_style_bg_opa(s_battery_fill, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_battery_fill, 0, 0);
+    lv_obj_set_style_pad_all(s_battery_fill, 0, 0);
+    lv_obj_add_flag(s_battery_fill, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *menu = ui_button(s_home, 400, 12, 64, 48, LV_SYMBOL_SETTINGS, COLOR_CARD, 20);
     lv_obj_add_event_cb(menu, on_menu, LV_EVENT_CLICKED, NULL);
@@ -1080,6 +1224,8 @@ static void build_pref_pages(void)
     lv_obj_t *info = ui_label(s_connection, 20, 100, 440, label, 20, COLOR_TEXT);
     lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
     lv_obj_set_height(info, 160);
+    s_connection_power = ui_label(s_connection, 20, 235, 440,
+                                  "电量：读取中", 18, COLOR_DIM);
     lv_obj_t *refresh = ui_button(s_connection, 16, 300, 448, 80, "刷新连接", COLOR_CARD, 20);
     lv_obj_add_event_cb(refresh, on_refresh, LV_EVENT_CLICKED, NULL);
 
@@ -1205,7 +1351,7 @@ static void show_provision_screen(const char *ssid, const char *pass, const char
              "SSID：%s\n密码：%s\n扫码连接 Wi-Fi\n页面未打开？192.168.4.1",
              s_prov_ssid, s_prov_pass);
     lv_label_set_text(s_prov_info, info);
-    show_screen(SCR_PROVISION);
+    if (s_screen != SCR_BOOT) show_screen(SCR_PROVISION);
 }
 
 /* ====================================================================== */
@@ -1219,6 +1365,7 @@ static void show_screen(screen_t s)
     s_screen = s;
     lv_obj_t *scr = NULL;
     switch (s) {
+    case SCR_BOOT: scr = s_boot; break;
     case SCR_HOME: scr = s_home; break;
     case SCR_DETAIL: scr = s_detail; break;
     case SCR_CONFIRM: scr = s_confirm; break;
@@ -1544,6 +1691,7 @@ static void on_result_back(lv_event_t *e)
 void ui_panel_init(void)
 {
     build_agent_icons();
+    build_boot();
     build_home();
     build_detail();
     build_confirm();
@@ -1553,16 +1701,26 @@ void ui_panel_init(void)
     build_provision();
     panel_store_set_view_context(s_page, NULL);
     refresh_prefs_ui();
-    show_screen(SCR_HOME);
+    refresh_power_ui();
+    s_boot_started_ms = ui_now_ms();
+    show_screen(SCR_BOOT);
 }
 
 void ui_show_provisioning(const char *ap_ssid, const char *ap_pass, const char *qr_payload)
 {
+    s_boot_provision = true;
     show_provision_screen(ap_ssid, ap_pass, qr_payload);
+}
+
+void ui_panel_boot_ready(void)
+{
+    s_boot_ready = true;
 }
 
 void ui_panel_tick(void)
 {
+    refresh_power_ui();
+    if (s_screen == SCR_BOOT) tick_boot();
     /* 1. drain one-shot UI events (action results etc.) */
     panel_ui_evt_t evt;
     while (panel_store_recv_ui_event(&evt, 0)) {

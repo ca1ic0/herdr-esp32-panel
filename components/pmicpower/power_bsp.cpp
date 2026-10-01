@@ -10,6 +10,7 @@
 const char *TAG = "axp2101";
 
 static XPowersPMU axp2101;
+static bool s_pmic_ready;
 
 static I2cMasterBus           *i2cbus_   = NULL;
 static i2c_master_dev_handle_t i2cPMICdev = NULL;
@@ -57,16 +58,32 @@ void Custom_PmicPortInit(I2cMasterBus *i2cbus,uint8_t dev_addr) {
         ESP_ERROR_CHECK(i2c_master_bus_add_device(BusHandle, &dev_cfg, &i2cPMICdev));
         i2cPMICAddress = dev_addr;
     }
-    if (axp2101.begin(i2cPMICAddress, AXP2101_SLAVE_Read, AXP2101_SLAVE_Write)) {
+    s_pmic_ready = axp2101.begin(i2cPMICAddress, AXP2101_SLAVE_Read, AXP2101_SLAVE_Write);
+    if (s_pmic_ready) {
         ESP_LOGI(TAG, "Init PMU SUCCESS!");
     } else {
         ESP_LOGE(TAG, "Init PMU FAILED!");
     }
-    Custom_PmicRegisterInit();
+    if (s_pmic_ready) Custom_PmicRegisterInit();
+}
+
+bool Custom_PmicReadBattery(PmicBatteryStatus *out) {
+    if (out == nullptr || !s_pmic_ready) return false;
+    out->battery_present = axp2101.isBatteryConnect();
+    out->external_power = axp2101.isVbusGood();
+    out->charging = out->battery_present && axp2101.isCharging();
+    out->percent = out->battery_present ? axp2101.getBatteryPercent() : -1;
+    out->millivolts = out->battery_present ? axp2101.getBattVoltage() : 0;
+    if (out->percent < 0 || out->percent > 100) out->percent = -1;
+    if (out->millivolts < 2500 || out->millivolts > 5000) out->millivolts = 0;
+    return true;
 }
 
 void Custom_PmicRegisterInit(void) {
     axp2101.setVbusCurrentLimit(XPOWERS_AXP2101_VBUS_CUR_LIM_2000MA);
+    axp2101.enableBattDetection();
+    axp2101.enableBattVoltageMeasure();
+    axp2101.enableGauge();
 
     if(axp2101.getDC1Voltage() != 3300) {
         axp2101.setDC1Voltage(3300);
