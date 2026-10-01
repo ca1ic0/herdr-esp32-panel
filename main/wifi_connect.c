@@ -64,9 +64,12 @@ void wifi_connect_start(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     /* unconfigured device: provisioning mode owns WiFi (AP + portal) */
-    if (!app_config_is_configured()) {
-        ESP_LOGW(TAG, "no WiFi credentials stored, entering provisioning");
-        provisioning_start();
+    bool configured = app_config_is_configured();
+    bool editing = configured && app_config_take_edit_request();
+    if (!configured || editing) {
+        ESP_LOGI(TAG, editing ? "entering temporary connection editor" :
+                 "no WiFi credentials stored, entering provisioning");
+        provisioning_start(editing);
         return;
     }
 

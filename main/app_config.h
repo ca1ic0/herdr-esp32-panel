@@ -21,6 +21,7 @@ extern "C" {
 #define CFG_PASS_MAX       64
 #define CFG_HOST_MAX       63
 #define CFG_TOKEN_MAX      95
+#define CFG_PROMPT_MAX     160
 
 typedef struct {
     char wifi_ssid[CFG_SSID_MAX + 1];
@@ -28,6 +29,7 @@ typedef struct {
     char backend_host[CFG_HOST_MAX + 1];
     uint16_t backend_port;
     char gateway_token[CFG_TOKEN_MAX + 1];   /* device-specific Bearer */
+    char continue_prompt[CFG_PROMPT_MAX + 1]; /* empty = gateway default */
     bool https;                              /* reserved; v1 is LAN HTTP */
 } app_config_t;
 
@@ -58,6 +60,10 @@ void app_config_auth_header(char *buf, size_t buflen);
 
 /** Clear Wi-Fi + gateway credentials (re-provisioning). */
 esp_err_t app_config_clear_credentials(void);
+
+/* One-shot reboot marker for the five-minute connection editor. */
+esp_err_t app_config_request_edit(void);
+bool app_config_take_edit_request(void);
 
 /** Single NVS flash init (used by app_config_init). */
 esp_err_t app_config_nvs_init(void);

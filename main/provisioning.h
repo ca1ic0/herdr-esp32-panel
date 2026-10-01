@@ -15,13 +15,16 @@ extern "C" {
 #endif
 
 /** Start SoftAP (WPA2) + DNS + HTTP config server. */
-void provisioning_start(void);
+void provisioning_start(bool editing);
 
 /** Stop SoftAP/DNS/HTTP and wipe the temporary password from RAM. */
 void provisioning_stop(void);
 
 /** True while provisioning mode is active. */
 bool provisioning_active(void);
+
+/** Seconds remaining in temporary edit mode; -1 for first boot. */
+int provisioning_remaining_seconds(void);
 
 /** SoftAP SSID (e.g. "HerdrPanel-3FA2"). */
 void provisioning_get_ap_ssid(char *buf, int buflen);

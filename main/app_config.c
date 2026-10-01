@@ -69,6 +69,8 @@ esp_err_t app_config_init(void)
         nvs_get_u16(h, "port", &s_cfg.backend_port);
         len = sizeof(s_cfg.gateway_token);
         nvs_get_str(h, "token", s_cfg.gateway_token, &len);
+        len = sizeof(s_cfg.continue_prompt);
+        nvs_get_str(h, "contprompt", s_cfg.continue_prompt, &len);
         uint8_t https = 0;
         nvs_get_u8(h, "https", &https);
         s_cfg.https = https != 0;
@@ -102,6 +104,7 @@ static esp_err_t validate(const app_config_t *cfg)
     }
     if (cfg->backend_port == 0) return ESP_ERR_INVALID_ARG;
     if (strlen(cfg->gateway_token) > CFG_TOKEN_MAX) return ESP_ERR_INVALID_ARG;
+    if (strlen(cfg->continue_prompt) > CFG_PROMPT_MAX) return ESP_ERR_INVALID_ARG;
     return ESP_OK;
 }
 
@@ -123,6 +126,7 @@ esp_err_t app_config_save(const app_config_t *cfg)
     if (err == ESP_OK) err = nvs_set_str(h, "host", cfg->backend_host);
     if (err == ESP_OK) err = nvs_set_u16(h, "port", cfg->backend_port);
     if (err == ESP_OK) err = nvs_set_str(h, "token", cfg->gateway_token);
+    if (err == ESP_OK) err = nvs_set_str(h, "contprompt", cfg->continue_prompt);
     if (err == ESP_OK) err = nvs_set_u8(h, "https", cfg->https ? 1 : 0);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
@@ -177,4 +181,29 @@ esp_err_t app_config_clear_credentials(void)
     err = nvs_commit(h);
     nvs_close(h);
     return err;
+}
+
+esp_err_t app_config_request_edit(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(h, "edit_pending", 1);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+bool app_config_take_edit_request(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    uint8_t requested = 0;
+    esp_err_t err = nvs_get_u8(h, "edit_pending", &requested);
+    if (err == ESP_OK && requested == 1) {
+        err = nvs_erase_key(h, "edit_pending");
+        if (err == ESP_OK) err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err == ESP_OK && requested == 1;
 }

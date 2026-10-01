@@ -32,6 +32,7 @@
 #include "panel_display.h"
 #include "panel_audio.h"
 #include "panel_power.h"
+#include "provisioning.h"
 #include "ui_common.h"
 
 #define SCREEN_W     480
@@ -116,7 +117,7 @@ static int s_pref_widget_count;
 static lv_obj_t *s_pref_status[9];
 static int s_pref_status_count;
 
-static lv_obj_t *s_prov_qr, *s_prov_info;
+static lv_obj_t *s_prov_qr, *s_prov_info, *s_prov_cancel;
 
 /* ---- local view state -------------------------------------------------- */
 
@@ -141,6 +142,7 @@ static uint32_t s_edit_id;
 static char s_prov_ssid[24];
 static char s_prov_pass[12];
 static char s_prov_qr_text[128];
+static int s_prov_remaining_last = -2;
 
 static uint32_t s_seen_generation;
 static int s_last_age_sec = -1;
@@ -169,6 +171,8 @@ static void on_pref_click(lv_event_t *e);
 static void on_pref_slider(lv_event_t *e);
 static void on_settings_nav(lv_event_t *e);
 static void on_sound_test(lv_event_t *e);
+static void on_connection_edit(lv_event_t *e);
+static void on_cancel_edit(lv_event_t *e);
 
 static void refresh_power_ui(void)
 {
@@ -1213,7 +1217,15 @@ static void build_pref_pages(void)
     add_pref_button(s_sessions, 76, "刷新间隔", PANEL_PREF_OVERVIEW_INTERVAL);
     add_pref_button(s_sessions, 150, "卡片排序", PANEL_PREF_CARD_ORDER);
     add_pref_button(s_sessions, 224, "隐藏空闲", PANEL_PREF_HIDE_IDLE);
-    ui_label(s_sessions, 24, 318, 432, "继续提示词：在主机配置", 18, COLOR_DIM);
+    app_config_t session_cfg;
+    app_config_get(&session_cfg);
+    char prompt_summary[224];
+    snprintf(prompt_summary, sizeof(prompt_summary), "继续提示词：%s",
+             session_cfg.continue_prompt[0] ? session_cfg.continue_prompt : "网关默认");
+    ui_label(s_sessions, 24, 305, 432, prompt_summary, 18, COLOR_DIM);
+    lv_obj_t *edit_prompt = ui_button(s_sessions, 16, 348, 448, 76,
+                                      "扫码编辑继续提示词", COLOR_CARD, 20);
+    lv_obj_add_event_cb(edit_prompt, on_connection_edit, LV_EVENT_CLICKED, NULL);
 
     s_connection = make_pref_page("连接", SCR_SETTINGS);
     app_config_t cfg;
@@ -1226,8 +1238,11 @@ static void build_pref_pages(void)
     lv_obj_set_height(info, 160);
     s_connection_power = ui_label(s_connection, 20, 235, 440,
                                   "电量：读取中", 18, COLOR_DIM);
-    lv_obj_t *refresh = ui_button(s_connection, 16, 300, 448, 80, "刷新连接", COLOR_CARD, 20);
+    lv_obj_t *refresh = ui_button(s_connection, 16, 285, 448, 66, "刷新连接", COLOR_CARD, 20);
     lv_obj_add_event_cb(refresh, on_refresh, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *edit_connection = ui_button(s_connection, 16, 365, 448, 66,
+                                          "扫码编辑连接", COLOR_ACCENT, 20);
+    lv_obj_add_event_cb(edit_connection, on_connection_edit, LV_EVENT_CLICKED, NULL);
 
     s_about = make_pref_page("关于", SCR_SETTINGS);
     ui_label(s_about, 20, 110, 440, "Herdr Panel\nESP-IDF · Panel API v1", 20, COLOR_TEXT);
@@ -1303,8 +1318,11 @@ static void refresh_prefs_ui(void)
 static void build_provision(void)
 {
     s_prov = make_screen();
-    ui_label(s_prov, 16, 24, 448, "连接设备热点", 28, COLOR_TEXT);
+    ui_label(s_prov, 16, 24, 360, "连接设备热点", 28, COLOR_TEXT);
     lv_obj_set_style_text_align(lv_obj_get_child(s_prov, 0), LV_TEXT_ALIGN_CENTER, 0);
+    s_prov_cancel = ui_button(s_prov, 386, 16, 78, 52, "取消", COLOR_CARD, 18);
+    lv_obj_add_event_cb(s_prov_cancel, on_cancel_edit, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_prov_cancel, LV_OBJ_FLAG_HIDDEN);
 
     /* white quiet zone */
     lv_obj_t *zone = lv_obj_create(s_prov);
@@ -1346,10 +1364,19 @@ static void show_provision_screen(const char *ssid, const char *pass, const char
     }
 #endif
 
+    s_prov_remaining_last = -2;
+    int remaining = provisioning_remaining_seconds();
+    if (remaining >= 0) lv_obj_clear_flag(s_prov_cancel, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(s_prov_cancel, LV_OBJ_FLAG_HIDDEN);
     char info[192];
-    snprintf(info, sizeof(info),
-             "SSID：%s\n密码：%s\n扫码连接 Wi-Fi\n页面未打开？192.168.4.1",
-             s_prov_ssid, s_prov_pass);
+    if (remaining >= 0)
+        snprintf(info, sizeof(info),
+                 "SSID：%s\n密码：%s\n网页：192.168.4.1\n编辑剩余 %02d:%02d",
+                 s_prov_ssid, s_prov_pass, remaining / 60, remaining % 60);
+    else
+        snprintf(info, sizeof(info),
+                 "SSID：%s\n密码：%s\n扫码连接 Wi-Fi\n网页：192.168.4.1",
+                 s_prov_ssid, s_prov_pass);
     lv_label_set_text(s_prov_info, info);
     if (s_screen != SCR_BOOT) show_screen(SCR_PROVISION);
 }
@@ -1454,6 +1481,22 @@ static void on_menu(lv_event_t *e)
         refresh_prefs_ui();
         show_screen(SCR_QUICK);
     }
+}
+
+static void on_connection_edit(lv_event_t *e)
+{
+    (void)e;
+    panel_cmd_t cmd = { .type = PANEL_CMD_EDIT_CONNECTION };
+    const char *msg = panel_store_enqueue_control(&cmd) ?
+                      "正在打开编辑热点…" : "忙碌，请稍后重试";
+    for (int i = 0; i < s_pref_status_count; i++)
+        lv_label_set_text(s_pref_status[i], msg);
+}
+
+static void on_cancel_edit(lv_event_t *e)
+{
+    (void)e;
+    if (provisioning_remaining_seconds() >= 0) esp_restart();
 }
 
 static void on_back(lv_event_t *e)
@@ -1721,6 +1764,17 @@ void ui_panel_tick(void)
 {
     refresh_power_ui();
     if (s_screen == SCR_BOOT) tick_boot();
+    if (s_screen == SCR_PROVISION) {
+        int remaining = provisioning_remaining_seconds();
+        if (remaining >= 0 && remaining != s_prov_remaining_last) {
+            s_prov_remaining_last = remaining;
+            char info[192];
+            snprintf(info, sizeof(info),
+                     "SSID：%s\n密码：%s\n网页：192.168.4.1\n编辑剩余 %02d:%02d",
+                     s_prov_ssid, s_prov_pass, remaining / 60, remaining % 60);
+            lv_label_set_text(s_prov_info, info);
+        }
+    }
     /* 1. drain one-shot UI events (action results etc.) */
     panel_ui_evt_t evt;
     while (panel_store_recv_ui_event(&evt, 0)) {
@@ -1739,6 +1793,9 @@ void ui_panel_tick(void)
             for (int i = 0; i < s_pref_status_count; i++) {
                 lv_label_set_text(s_pref_status[i], evt.message);
             }
+        } else if (evt.type == PANEL_EVT_FATAL_ERROR) {
+            for (int i = 0; i < s_pref_status_count; i++)
+                lv_label_set_text(s_pref_status[i], evt.message);
         }
     }
 

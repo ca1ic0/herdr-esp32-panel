@@ -18,6 +18,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
@@ -353,6 +354,15 @@ static void poll_detail(int64_t now_ms)
             return;
         }
         handle_server_id(det.server_id);
+        if (det.pending.source == PANEL_SOURCE_NEW_PROMPT &&
+            (det.pending.choices & PANEL_CHOICE_CONTINUE)) {
+            app_config_t config;
+            app_config_get(&config);
+            if (config.continue_prompt[0] != '\0') {
+                snprintf(det.pending.prompt, sizeof(det.pending.prompt),
+                         "%s", config.continue_prompt);
+            }
+        }
         det.fetched_at_ms = now_ms;
         panel_store_publish_detail(&det);
         s_next_detail_ms = now_ms + DETAIL_PERIOD_MS;
@@ -462,6 +472,19 @@ static void worker_task(void *arg)
                 }
                 break;
             }
+            case PANEL_CMD_EDIT_CONNECTION:
+                if (app_config_request_edit() == ESP_OK) {
+                    esp_restart();
+                } else {
+                    panel_ui_evt_t evt = { .type = PANEL_EVT_FATAL_ERROR };
+                    snprintf(evt.message, sizeof(evt.message),
+                             "无法打开编辑热点，请重试");
+                    if (!panel_store_post_ui_event(&evt)) {
+                        s_parked_config_evt = evt;
+                        s_parked_config_evt_valid = true;
+                    }
+                }
+                break;
             default:
                 break;
             }

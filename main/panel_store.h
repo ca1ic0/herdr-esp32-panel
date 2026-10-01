@@ -31,6 +31,7 @@ typedef enum {
     PANEL_CMD_REFRESH,
     PANEL_CMD_RECONNECT,
     PANEL_CMD_SET_PREF,
+    PANEL_CMD_EDIT_CONNECTION,
     PANEL_CMD_ACTION,               /* goes through action_q only */
 } panel_cmd_type_t;
 
