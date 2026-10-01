@@ -105,6 +105,10 @@ static esp_err_t validate(const app_config_t *cfg)
     if (cfg->backend_port == 0) return ESP_ERR_INVALID_ARG;
     if (strlen(cfg->gateway_token) > CFG_TOKEN_MAX) return ESP_ERR_INVALID_ARG;
     if (strlen(cfg->continue_prompt) > CFG_PROMPT_MAX) return ESP_ERR_INVALID_ARG;
+    for (const unsigned char *p = (const unsigned char *)cfg->continue_prompt; *p; p++) {
+        /* The confirmation page must show every byte that will be sent. */
+        if ((*p < 0x20 && *p != '\n') || *p == 0x7f) return ESP_ERR_INVALID_ARG;
+    }
     return ESP_OK;
 }
 
