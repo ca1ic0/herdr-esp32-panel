@@ -72,7 +72,10 @@ void Lvgl_PortInit(DisplayPort &display) {
         (uint16_t)display.Get_Height(), // 垂直分辨率
         ESP_LV_ADAPTER_ROTATE_0 		// 旋转角度
     );
-	disp_cfg.profile.buffer_height = 100; // 设置更合适的缓冲区高度以提高性能
+	/* Architecture §6 budget: 24-40 row partial buffers (~37.5 KiB/block at
+	 * 40 rows RGB565x480), not 100 rows (~94 KiB). UI uses small-area
+	 * redraws only; measure heap watermark on device before raising this. */
+	disp_cfg.profile.buffer_height = 40;
 	
 	disp = esp_lv_adapter_register_display(&disp_cfg);
     assert(disp != NULL);
