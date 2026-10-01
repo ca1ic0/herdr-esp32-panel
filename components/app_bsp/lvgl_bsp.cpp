@@ -72,10 +72,9 @@ void Lvgl_PortInit(DisplayPort &display) {
         (uint16_t)display.Get_Height(), // 垂直分辨率
         ESP_LV_ADAPTER_ROTATE_0 		// 旋转角度
     );
-	/* Architecture §6 budget: 24-40 row partial buffers (~37.5 KiB/block at
-	 * 40 rows RGB565x480), not 100 rows (~94 KiB). UI uses small-area
-	 * redraws only; measure heap watermark on device before raising this. */
-	disp_cfg.profile.buffer_height = 40;
+	/* Two 24-row RGB565 buffers use about 45 KiB at 480 px wide. This
+	 * offsets the larger LVGL object pool and leaves more heap for Wi-Fi. */
+	disp_cfg.profile.buffer_height = 24;
 	
 	disp = esp_lv_adapter_register_display(&disp_cfg);
     assert(disp != NULL);
