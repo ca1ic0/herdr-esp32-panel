@@ -88,13 +88,22 @@ typedef enum {
     PANEL_SOURCE_NEW_PROMPT,
 } panel_pending_source_t;
 
-/* Semantic actions. Firmware never hardcodes CLI keystrokes. */
+/* Semantic actions. Firmware never hardcodes CLI keystrokes.
+ *
+ * PANEL_ACT_STOP is not in the gateway's Action literal yet
+ * (refer/herdr-restful/backend/app/panel/view_models.py:
+ *  Action = Literal["allow_once", "allow_always", "deny", "continue"]),
+ * so it never arrives in `choices` and the UI shows it as an unavailable
+ * hint ("stop it on the host"). It is kept here so that adding gateway
+ * support is a one-line change: a new PANEL_CHOICE_STOP bit plus the parse
+ * branch in panel_api_client.c. */
 typedef enum {
     PANEL_ACT_NONE = 0,
     PANEL_ACT_ALLOW_ONCE,
     PANEL_ACT_ALLOW_ALWAYS,
     PANEL_ACT_DENY,
     PANEL_ACT_CONTINUE,
+    PANEL_ACT_STOP,
 } panel_action_id_t;
 
 /* Bitmask of available choices from the gateway. */
@@ -102,6 +111,7 @@ typedef enum {
 #define PANEL_CHOICE_ALLOW_ALWAYS   (1u << 1)
 #define PANEL_CHOICE_DENY           (1u << 2)
 #define PANEL_CHOICE_CONTINUE       (1u << 3)
+#define PANEL_CHOICE_STOP           (1u << 4)   /* not sent by the gateway yet */
 
 /* ---- overview record -------------------------------------------------- */
 
@@ -262,6 +272,7 @@ static inline const char *panel_action_id_name(panel_action_id_t a)
     case PANEL_ACT_ALLOW_ALWAYS: return "始终允许";
     case PANEL_ACT_DENY:         return "拒绝";
     case PANEL_ACT_CONTINUE:     return "继续";
+    case PANEL_ACT_STOP:         return "停止";
     default:                     return "";
     }
 }
@@ -273,6 +284,7 @@ static inline panel_action_id_t panel_choice_to_action(uint8_t choice_bit)
     case PANEL_CHOICE_ALLOW_ALWAYS: return PANEL_ACT_ALLOW_ALWAYS;
     case PANEL_CHOICE_DENY:         return PANEL_ACT_DENY;
     case PANEL_CHOICE_CONTINUE:     return PANEL_ACT_CONTINUE;
+    case PANEL_CHOICE_STOP:         return PANEL_ACT_STOP;
     default:                        return PANEL_ACT_NONE;
     }
 }

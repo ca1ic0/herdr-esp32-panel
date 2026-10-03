@@ -16,7 +16,6 @@ static QueueHandle_t s_control_q;   /* capacity 4 */
 static QueueHandle_t s_ui_evt_q;    /* capacity 8 */
 
 static volatile bool s_action_reserved;
-static int s_view_page;
 static char s_view_term[PANEL_TERM_ID_LEN];
 
 /* Called with s_lock held. Stable insertion sort keeps gateway order when
@@ -155,12 +154,18 @@ uint32_t panel_store_generation(void)
     return s_generation;
 }
 
-int panel_store_get_page(panel_agent_card_t out4[4], int page,
-                         int *count_out, int *total_out,
-                         panel_conn_state_t *conn_out)
+/*
+ * Copy the visible cards in display order (UI_DESIGN.md §4.1: the home
+ * screen is a single scrolling list, so there is no page index any more).
+ * `out` must hold PANEL_MAX_AGENTS entries; returns the stored card count.
+ * Keeping this bounded-by-value avoids copying the whole snapshot onto the
+ * LVGL stack.
+ */
+int panel_store_get_visible(panel_agent_card_t *out, int max_out,
+                            int *total_out, panel_conn_state_t *conn_out)
 {
-    if (out4 == NULL) return 0;
-    memset(out4, 0, 4 * sizeof(*out4));
+    if (out == NULL || max_out <= 0) return 0;
+    memset(out, 0, (size_t)max_out * sizeof(*out));
     if (s_lock == NULL) return 0;
     panel_prefs_t prefs;
     panel_prefs_get(&prefs);
@@ -168,13 +173,10 @@ int panel_store_get_page(panel_agent_card_t out4[4], int page,
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
         int index[PANEL_MAX_AGENTS];
         count = visible_index_locked(&prefs, index);
-        for (int i = 0; i < 4; i++) {
-            int idx = page * 4 + i;
-            if (idx >= 0 && idx < count) {
-                out4[i] = s_overview.agents[index[idx]];
-            }
+        if (count > max_out) count = max_out;
+        for (int i = 0; i < count; i++) {
+            out[i] = s_overview.agents[index[i]];
         }
-        if (count_out != NULL) *count_out = count;
         if (total_out != NULL) *total_out = s_overview.total_count;
         if (conn_out != NULL) *conn_out = s_conn;
         xSemaphoreGive(s_lock);
@@ -226,11 +228,10 @@ int panel_store_blocked_count(void)
     return n;
 }
 
-void panel_store_set_view_context(int page, const char *selected_terminal_id)
+void panel_store_set_view_context(const char *selected_terminal_id)
 {
     if (s_lock == NULL) return;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
-        s_view_page = page;
         snprintf(s_view_term, sizeof(s_view_term), "%s",
                  selected_terminal_id != NULL ? selected_terminal_id : "");
         xSemaphoreGive(s_lock);
@@ -248,9 +249,11 @@ bool panel_store_sound_scope_match(const char *terminal_id, uint8_t scope)
         if (scope == PANEL_SOUND_SELECTED) {
             match = s_view_term[0] && strcmp(s_view_term, terminal_id) == 0;
         } else if (scope == PANEL_SOUND_PAGE) {
+            /* the whole home list is one screen now, so "this page" is
+             * simply every card that passes the current visibility prefs */
             int index[PANEL_MAX_AGENTS];
             int n = visible_index_locked(&prefs, index);
-            for (int i = s_view_page * 4; i < s_view_page * 4 + 4 && i < n; i++) {
+            for (int i = 0; i < n; i++) {
                 if (strcmp(s_overview.agents[index[i]].terminal_id, terminal_id) == 0) {
                     match = true;
                     break;

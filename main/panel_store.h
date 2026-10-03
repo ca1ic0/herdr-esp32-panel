@@ -84,14 +84,14 @@ void panel_store_get_sound_notice(char *out, size_t capacity);
 void panel_store_get_overview(panel_overview_t *out, panel_conn_state_t *conn_out);
 
 /*
- * Copy only the four cards of one overview page plus counts (lock held
- * briefly). Preferred over panel_store_get_overview() on the UI task:
- * avoids copying the full 24-card snapshot onto the LVGL stack.
- * Returns the stored card count.
+ * Copy the visible cards in display order (UI_DESIGN.md §4.1: the home
+ * screen is a single scrolling list, so there is no page index any more).
+ * `out` must have room for `max_out` entries (pass PANEL_MAX_AGENTS).
+ * Returns the number of cards written. Copying only the visible cards keeps
+ * the multi-KB snapshot off the LVGL task stack.
  */
-int panel_store_get_page(panel_agent_card_t out4[4], int page,
-                         int *count_out, int *total_out,
-                         panel_conn_state_t *conn_out);
+int panel_store_get_visible(panel_agent_card_t *out, int max_out,
+                            int *total_out, panel_conn_state_t *conn_out);
 
 /** Copy current detail (lock held briefly). Returns false if none. */
 bool panel_store_get_detail(panel_detail_t *out);
@@ -108,8 +108,13 @@ int panel_store_first_blocked_index(void);
 /** Number of blocked cards in the stored overview. */
 int panel_store_blocked_count(void);
 
-/** UI-owned current page/selection for sound scope filtering. */
-void panel_store_set_view_context(int page, const char *selected_terminal_id);
+/**
+ * UI-owned current selection, used for sound scope filtering.
+ * The home screen is a single scrolling list (UI_DESIGN.md §4.1), so there is
+ * no page index any more: PANEL_SOUND_SELECTED matches the opened session and
+ * PANEL_SOUND_PAGE matches everything currently visible in the list.
+ */
+void panel_store_set_view_context(const char *selected_terminal_id);
 bool panel_store_sound_scope_match(const char *terminal_id, uint8_t scope);
 
 /* ---- queues ---------------------------------------------------------- */

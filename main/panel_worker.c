@@ -462,7 +462,7 @@ static void worker_task(void *arg)
                     .config_saved = err == ESP_OK,
                 };
                 snprintf(evt.message, sizeof(evt.message), "%s",
-                         err == ESP_OK ? "已保存" : "保存失败，已恢复原值");
+                         err == ESP_OK ? "Saved" : "Save failed; previous value restored");
                 if (!panel_store_post_ui_event(&evt)) {
                     s_parked_config_evt = evt;
                     s_parked_config_evt_valid = true;
@@ -483,7 +483,7 @@ static void worker_task(void *arg)
                 } else {
                     panel_ui_evt_t evt = { .type = PANEL_EVT_FATAL_ERROR };
                     snprintf(evt.message, sizeof(evt.message),
-                             "无法打开编辑热点，请重试");
+                             "Could not open edit hotspot; try again");
                     if (!panel_store_post_ui_event(&evt)) {
                         s_parked_config_evt = evt;
                         s_parked_config_evt_valid = true;

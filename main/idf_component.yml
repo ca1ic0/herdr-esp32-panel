@@ -2,6 +2,9 @@
 dependencies:
   espressif/esp_lcd_sh8601: ^1.0.0
   waveshare/esp_lcd_touch_cst9217: ^1.0.4
+  # Onboard 6-axis IMU, used only to wake the standby screen. Shares the
+  # I2C0 bus with the PMIC, the touch controller and the ES8311 codec.
+  waveshare/qmi8658: "^2.0.1"
   espressif/esp_lvgl_adapter: ^0.3.0
   lvgl/lvgl: ^9.5.0
   espressif/cjson: ^1.7.18

@@ -1,12 +1,13 @@
 /*
  * LVGL UI — Herdr decision panel (UI_DESIGN.md v1).
  *
- * HOM  4-grid overview, swipe pages
- * DET  session detail + pending card + action buttons (gateway choices only)
+ * HOM  2-column scrolling grid of sessions
+ * DET  session detail + 3 icon action slots (gateway choices only)
  * CNF  full-screen confirm before any semantic action
  * RST  sending / delivered / uncertain result
  * SET  connection, display, about, re-provision (view + simple toggles)
  * PRV  WPA2 provisioning QR
+ * STB  idle standby: breathing clock, then fully dark (UI_DESIGN.md §4.3)
  *
  * Selection is (terminal_id, selection_epoch). Late network responses with
  * a mismatched epoch are discarded in panel_worker before reaching here.
@@ -26,6 +27,8 @@
 #include "lvgl.h"
 #include "sdkconfig.h"
 
+static const char *TAG = "ui_panel";
+
 #include "app_config.h"
 #include "panel_model.h"
 #include "panel_store.h"
@@ -33,21 +36,27 @@
 #include "panel_display.h"
 #include "panel_audio.h"
 #include "panel_power.h"
+#include "panel_motion.h"
 #include "provisioning.h"
 #include "ui_common.h"
 
 #define SCREEN_W     480
 #define SCREEN_H     480
 
-/* UI_DESIGN.md §4.1 card slots */
-static const struct { int x, y, w, h; } CARD_POS[4] = {
-    { 16,  76, 218, 160 },
-    { 246, 76, 218, 160 },
-    { 16,  248, 218, 160 },
-    { 246, 248, 218, 160 },
-};
-
-#define PAGE_SIZE    4
+/* UI_DESIGN.md §4.1 home is a compact two-column scrolling grid, so a wall of
+ * sessions stays scannable instead of costing one screen per few rows. The
+ * grid scrolls vertically (LVGL native), so there is no paging, no swipe
+ * handler and no page counter any more. */
+#define LIST_TOP        70      /* below the top bar */
+#define LIST_BOTTOM     402     /* above the notice row */
+#define LIST_X          8
+#define LIST_W          (SCREEN_W - 2 * LIST_X)
+#define CARD_H          78
+#define CARD_W          ((LIST_W - CARD_GAP) / 2)
+#define CARD_GAP        6
+/* Reusable card widgets. 10 rows = 20 sessions, five screenfuls; beyond that
+ * the store caps the overview at PANEL_MAX_AGENTS. */
+#define VISIBLE_ROWS    10
 
 typedef enum {
     SCR_BOOT = 0,
@@ -66,6 +75,7 @@ typedef enum {
     SCR_ABOUT,
     SCR_REPROVISION_CONFIRM,
     SCR_PROVISION,
+    SCR_STANDBY,
 } screen_t;
 
 typedef struct {
@@ -86,18 +96,30 @@ typedef struct {
 
 static lv_obj_t *s_boot, *s_home, *s_detail, *s_confirm, *s_result, *s_settings, *s_prov;
 static lv_obj_t *s_boot_cells[4], *s_boot_progress;
+/* Standby (UI_DESIGN.md §4.3): a big clock over three breathing rings. Built
+ * lazily on the first idle timeout so it costs nothing on the normal path. */
+static lv_obj_t *s_standby, *s_standby_clock, *s_standby_date, *s_standby_note;
+static lv_obj_t *s_standby_ring[3];
 static lv_obj_t *s_quick, *s_sound, *s_sound_more, *s_quiet;
 static lv_obj_t *s_display, *s_sessions, *s_connection, *s_about, *s_reprovision;
 
-static lv_obj_t *s_conn_badge, *s_pending_count, *s_page_label, *s_total_label;
+static lv_obj_t *s_conn_badge, *s_pending_count;
 static lv_obj_t *s_battery_label, *s_battery_fill, *s_connection_power;
 static lv_obj_t *s_sound_notice;
 static lv_obj_t *s_empty_label;
-static cell_t s_cells[4];
+/* Home is one vertical scrolling list (UI_DESIGN.md §4.1). The cell array is
+ * a pool of reusable rows: s_cell_count rows exist, and a card is either
+ * bound to a session (terminal_id non-empty) or shown as an empty slot. */
+static lv_obj_t *s_card_list;
+static cell_t s_cells[PANEL_MAX_AGENTS];
+static int s_cell_count;
 
 static lv_obj_t *s_det_name, *s_det_status, *s_det_project, *s_det_updated;
 static lv_obj_t *s_det_content;
-static lv_obj_t *s_btn_allow, *s_btn_deny, *s_btn_always, *s_btn_continue, *s_btn_host;
+/* Three action slots in the upper half (UI_DESIGN.md §4.2). The old 88 px
+ * bottom button row was removed so the content area could grow. */
+static lv_obj_t *s_act_slot[3], *s_act_glyph[3];
+static lv_obj_t *s_det_act_caption;
 static lv_obj_t *s_det_hint;
 
 static lv_obj_t *s_cnf_title, *s_cnf_body, *s_cnf_hint;
@@ -123,7 +145,6 @@ static lv_obj_t *s_prov_qr, *s_prov_info, *s_prov_cancel;
 /* ---- local view state -------------------------------------------------- */
 
 static int s_card_count;
-static int s_page;
 static screen_t s_screen = SCR_HOME;
 
 /* selection */
@@ -137,6 +158,16 @@ static int64_t s_boot_started_ms;
 static bool s_boot_provision;
 static bool s_boot_ready;
 
+/* Standby / blank state machine (UI_DESIGN.md §4.3). */
+typedef enum {
+    SB_AWAKE = 0,      /* normal UI */
+    SB_CLOCK,          /* idle long enough: clock screen, dimmed */
+    SB_BLANK,          /* idle longer still: screen fully dark */
+} standby_stage_t;
+static standby_stage_t s_sb_stage;
+static int s_sb_last_minute = -1;   /* forces a redraw when the minute flips */
+static int s_sb_clock_built;
+
 static void log_ui_memory(const char *phase)
 {
     lv_mem_monitor_t mon = { 0 };
@@ -147,6 +178,38 @@ static void log_ui_memory(const char *phase)
 }
 
 static uint32_t s_edit_id;
+
+/*
+ * One-shot font self-test (UI_DESIGN.md §2). CJK text rendered blank while
+ * Latin rendered fine, which is either a glyph lookup miss or a layout
+ * problem. Ask LVGL directly instead of guessing: report whether the glyph
+ * descriptor is found, its advance/box size and the resolved font.
+ */
+static void log_font_probe(void)
+{
+    /* lv_font_get_glyph_dsc() takes a Unicode code point, not a UTF-8 byte. */
+    static const struct { const char *label; uint32_t cp; } probe[] = {
+        { "latin-A",  0x0041 },   /* A */
+        { "hui",      0x4F1A },
+        { "hua",      0x8BDD },
+        { "wu",       0x65E0 },
+        { "xian",     0x7EBF },
+    };
+    lv_font_t *f = ui_font(20);
+    ESP_LOGI(TAG, "probe font=%p line_height=%d base_line=%d fallback=%p",
+             (void *)f, (int)f->line_height, (int)f->base_line, (void *)f->fallback);
+    for (size_t i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
+        lv_font_glyph_dsc_t dsc;
+        memset(&dsc, 0, sizeof(dsc));
+        bool found = lv_font_get_glyph_dsc(f, &dsc, probe[i].cp, 0);
+        ESP_LOGI(TAG, "%s U+%04X found=%d adv_w=%d box_w=%d box_h=%d "
+                 "ofs_x=%d ofs_y=%d stride=%d resolved=%p",
+                 probe[i].label, (unsigned)probe[i].cp,
+                 (int)found, (int)dsc.adv_w, (int)dsc.box_w, (int)dsc.box_h,
+                 (int)dsc.ofs_x, (int)dsc.ofs_y, (int)dsc.stride,
+                 (void *)dsc.resolved_font);
+    }
+}
 
 /* provisioning copy */
 static char s_prov_ssid[24];
@@ -175,11 +238,11 @@ static void on_confirm_ok(lv_event_t *e);
 static void on_result_back(lv_event_t *e);
 static void on_refresh(lv_event_t *e);
 static void on_jump_blocked(lv_event_t *e);
-static void on_home_gesture(lv_event_t *e);
 static void refresh_prefs_ui(void);
 static void on_pref_click(lv_event_t *e);
 static void on_pref_slider(lv_event_t *e);
 static void on_settings_nav(lv_event_t *e);
+static void ensure_settings_pages(screen_t target);
 static void on_sound_test(lv_event_t *e);
 static void on_connection_edit(lv_event_t *e);
 static void on_cancel_edit(lv_event_t *e);
@@ -367,38 +430,6 @@ static void bump_epoch(void)
     s_sel_epoch++;
 }
 
-/* Let LV_EVENT_GESTURE bubble from this object and all descendants, so a
- * swipe that starts on a card or label still reaches the home screen. */
-static void bubble_gestures(lv_obj_t *obj)
-{
-    lv_obj_add_flag(obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    uint32_t n = lv_obj_get_child_count(obj);
-    for (uint32_t i = 0; i < n; i++) {
-        lv_obj_t *child = lv_obj_get_child(obj, (int32_t)i);
-        if (child != NULL) bubble_gestures(child);
-    }
-}
-
-static void page_prev(void)
-{
-    if (s_page > 0) {
-        s_page--;
-        panel_store_set_view_context(s_page, s_sel_term);
-        s_seen_generation = 0;  /* force redraw on next tick */
-    }
-}
-
-static void page_next(void)
-{
-    int pages = (s_card_count + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (pages < 1) pages = 1;
-    if (s_page < pages - 1) {
-        s_page++;
-        panel_store_set_view_context(s_page, s_sel_term);
-        s_seen_generation = 0;  /* force redraw on next tick */
-    }
-}
-
 static const char *shape_symbol(panel_agent_state_t st)
 {
     switch (st) {
@@ -433,6 +464,43 @@ static lv_obj_t *make_screen(void)
     lv_obj_set_style_pad_all(scr, 0, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     return scr;
+}
+
+/* Same stage ladder panel_prefs.c validates against; kept in one place here
+ * so the settings button and its label cannot drift apart. */
+static const uint16_t k_sb_stages[] = {
+    PANEL_STANDBY_OFF, PANEL_STANDBY_1MIN, PANEL_STANDBY_2MIN,
+    PANEL_STANDBY_3MIN, PANEL_STANDBY_5MIN, PANEL_STANDBY_10MIN,
+    PANEL_STANDBY_15MIN,
+};
+#define SB_STAGE_N (sizeof(k_sb_stages) / sizeof(k_sb_stages[0]))
+
+static int standby_next(int v)
+{
+    for (size_t i = 0; i < SB_STAGE_N; i++) {
+        if (k_sb_stages[i] == v) {
+            return k_sb_stages[(i + 1) % SB_STAGE_N];
+        }
+    }
+    return PANEL_STANDBY_OFF;
+}
+
+/* Settings pages are English by convention (UI_DESIGN.md §2.1). */
+static const char *standby_duration(int seconds)
+{
+    if (seconds < 60) return "1 min";
+    if (seconds % 60 == 0) {
+        switch (seconds / 60) {
+        case 1:  return "1 min";
+        case 2:  return "2 min";
+        case 3:  return "3 min";
+        case 5:  return "5 min";
+        case 10: return "10 min";
+        case 15: return "15 min";
+        default: return "Off";
+        }
+    }
+    return "Off";
 }
 
 static void build_boot(void)
@@ -496,6 +564,214 @@ static void tick_boot(void)
 }
 
 /* ====================================================================== */
+/* STB — standby clock (UI_DESIGN.md §4.3)                               */
+/* ====================================================================== */
+
+/*
+ * A big HH:MM over three concentric rings that breathe out of phase. The
+ * motion matters more than the digits: an AMOLED left on a static image
+ * burns the pixels in, so the rings change shape continuously and the clock
+ * area is the only still part. Everything is built on entry to standby and
+ * torn down on exit, so the normal path pays nothing for it.
+ */
+static void build_standby(void)
+{
+    if (s_sb_clock_built) return;
+    s_sb_clock_built = 1;
+
+    s_standby = make_screen();
+
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *ring = lv_obj_create(s_standby);
+        /* 40 px apart in radius, so the three rings read as one pulse */
+        int d = 300 + i * 40;
+        lv_obj_set_size(ring, d, d);
+        lv_obj_center(ring);
+        lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(ring, 2, 0);
+        lv_obj_set_style_border_color(ring, lv_color_hex(COLOR_ACCENT), 0);
+        lv_obj_set_style_border_opa(ring, LV_OPA_20, 0);
+        lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+        lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
+        s_standby_ring[i] = ring;
+    }
+
+    s_standby_clock = ui_label(s_standby, 40, 190, 400, "--:--", 24, COLOR_TEXT);
+    lv_obj_set_style_text_align(s_standby_clock, LV_TEXT_ALIGN_CENTER, 0);
+    /* Scale the glyphs up: ui_font(24) is the largest cut we carry and a
+     * clock is the one place where size is worth the pixels. LVGL 9 scales
+     * around the pivot, so centre the pivot on the label first. */
+    lv_obj_set_style_transform_pivot_x(s_standby_clock, 200, 0);
+    lv_obj_set_style_transform_pivot_y(s_standby_clock, 16, 0);
+    lv_obj_set_style_transform_scale(s_standby_clock, 256, 0);
+
+    s_standby_date = ui_label(s_standby, 40, 292, 400, "", 16, COLOR_DIM);
+    lv_obj_set_style_text_align(s_standby_date, LV_TEXT_ALIGN_CENTER, 0);
+
+    s_standby_note = ui_label(s_standby, 40, 414, 400,
+                              LV_SYMBOL_UP " 触摸或摇一摇唤醒", 14, COLOR_DISABLED);
+    lv_obj_set_style_text_align(s_standby_note, LV_TEXT_ALIGN_CENTER, 0);
+}
+
+/* Local wall clock, honouring the same fixed UTC offset the rest of the
+ * firmware uses for quiet hours (panel_worker.c quiet_now()). SNTP keeps
+ * time() in UTC, so shifting here keeps one source of truth. */
+static void standby_localtime(struct tm *out)
+{
+    time_t now = time(NULL);
+    panel_prefs_t p;
+    panel_prefs_get(&p);
+    if (now < 1704067200) {          /* clock never synced */
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    now += p.utc_offset_minutes * 60;
+    gmtime_r(&now, out);
+}
+
+static const char *WEEKDAY_NAMES[] = {
+    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+};
+static const char *MONTH_NAMES[] = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+};
+
+static void standby_refresh_clock(void)
+{
+    struct tm local;
+    standby_localtime(&local);
+    char buf[64];
+    if (local.tm_year == 70) {       /* unsynced sentinel from standby_localtime */
+        lv_label_set_text(s_standby_clock, "--:--");
+        lv_label_set_text(s_standby_date, "等待网络时间");
+        s_sb_last_minute = -1;
+        return;
+    }
+    snprintf(buf, sizeof(buf), "%02d:%02d", local.tm_hour, local.tm_min);
+    lv_label_set_text(s_standby_clock, buf);
+    snprintf(buf, sizeof(buf), "%s %s %d", WEEKDAY_NAMES[local.tm_wday],
+             MONTH_NAMES[local.tm_mon], local.tm_year + 1900);
+    lv_label_set_text(s_standby_date, buf);
+    s_sb_last_minute = local.tm_hour * 60 + local.tm_min;
+}
+
+/* Ring 0 leads, rings 1 and 2 trail by a third of a cycle each, so the
+ * pattern never looks like a single blinking dot. 6 s per breath. */
+static void standby_animate(int64_t now_ms)
+{
+    for (int i = 0; i < 3; i++) {
+        int64_t phase = now_ms + (int64_t)i * 2000;
+        int64_t t = phase % 6000;
+        /* triangle 0..4096..0 gives a symmetric rise and fall */
+        int32_t tri = t < 3000 ? (int32_t)(t * 4096 / 3000)
+                               : (int32_t)((6000 - t) * 4096 / 3000);
+        /* scale 80%..100% and opacity 10%..45% */
+        int32_t scale = 2048 + tri / 2;             /* 256 == 100% */
+        lv_obj_set_style_transform_scale(s_standby_ring[i], scale, 0);
+        lv_obj_set_style_transform_pivot_x(s_standby_ring[i],
+                                           lv_pct(50), 0);
+        lv_obj_set_style_transform_pivot_y(s_standby_ring[i],
+                                           lv_pct(50), 0);
+        lv_obj_set_style_border_opa(s_standby_ring[i],
+                                    (lv_opa_t)(LV_OPA_10 + tri / 100), 0);
+    }
+}
+
+static void enter_standby(standby_stage_t stage)
+{
+    build_standby();
+    panel_prefs_t p;
+    panel_prefs_get(&p);
+
+    standby_refresh_clock();
+    standby_animate(ui_now_ms());
+
+    s_screen = SCR_STANDBY;
+    /* No transition: a fade in from the session list would flash the whole
+     * panel at a moment the user is not looking. */
+    lv_screen_load(s_standby);
+    panel_display_set_brightness(p.dim_brightness);
+    s_dimmed = true;
+    s_sb_stage = stage;
+    ESP_LOGI(TAG, "standby: clock after %d s idle", p.idle_display_seconds);
+}
+
+static void leave_standby(void)
+{
+    if (s_screen != SCR_STANDBY) return;
+    s_sb_stage = SB_AWAKE;
+    s_sb_last_minute = -1;
+    /* The real screen was never torn down, so hand control back to it and
+     * force a refresh; the store generation may be many polls old. */
+    s_seen_generation = 0;
+    show_screen(SCR_HOME);
+    panel_prefs_t p;
+    panel_prefs_get(&p);
+    panel_display_set_brightness(p.brightness);
+    s_dimmed = false;
+    ESP_LOGI(TAG, "standby cleared");
+}
+
+/*
+ * The one place that decides which standby stage applies (UI_DESIGN.md §4.3).
+ * Called from the LVGL tick.
+ *
+ * Touch needs no code: any indev activity rewrites disp->last_activity_time,
+ * which is exactly what lv_display_get_inactive_time() reports, so a tap
+ * drops the elapsed time back to zero by itself. Motion has no such side
+ * effect, so panel_motion_wake_pending() is consumed here.
+ *
+ * Confirm and provisioning are excluded entirely. Both are modal and
+ * short-lived: blanking the confirm page would hide the very text the user
+ * is being asked to read, and the provisioning QR has to stay up until a
+ * phone has scanned it.
+ */
+static void update_standby(void)
+{
+    panel_prefs_t p;
+    panel_prefs_get(&p);
+
+    if (s_screen == SCR_STANDBY) {
+        bool woke = (p.motion_wake && panel_motion_wake_pending());
+        uint32_t idle_ms = lv_display_get_inactive_time(NULL);
+        if (woke || idle_ms < 500) {
+            leave_standby();
+            return;
+        }
+        if (p.idle_blank_seconds != 0 &&
+            idle_ms >= (uint32_t)p.idle_blank_seconds * 1000u) {
+            /* Fully dark: an AMOLED with no pixels lit draws almost no power
+             * and cannot burn in. The widgets stay alive behind the black
+             * screen, so waking costs nothing and no rebuild is needed. */
+            if (s_sb_stage != SB_BLANK) {
+                panel_display_set_brightness(0);
+                s_sb_stage = SB_BLANK;
+                ESP_LOGI(TAG, "standby: blank after %d s idle",
+                         p.idle_blank_seconds);
+            }
+            return;
+        }
+        standby_animate(ui_now_ms());
+        struct tm local;
+        standby_localtime(&local);
+        if (local.tm_year != 70 &&
+            local.tm_hour * 60 + local.tm_min != s_sb_last_minute) {
+            standby_refresh_clock();
+        }
+        return;
+    }
+
+    if (s_screen == SCR_CONFIRM || s_screen == SCR_PROVISION) return;
+    if (p.idle_display_seconds == 0) return;
+    if (lv_display_get_inactive_time(NULL) <
+        (uint32_t)p.idle_display_seconds * 1000u) return;
+
+    enter_standby(SB_CLOCK);
+}
+
+/* ====================================================================== */
 /* HOM                                                                     */
 /* ====================================================================== */
 
@@ -534,24 +810,45 @@ static void build_home(void)
     lv_obj_t *menu = ui_button(s_home, 400, 12, 64, 48, LV_SYMBOL_SETTINGS, COLOR_CARD, 20);
     lv_obj_add_event_cb(menu, on_menu, LV_EVENT_CLICKED, NULL);
 
-    /* 4 cards */
-    for (int i = 0; i < 4; i++) {
+    /*
+     * Two-column wrapping grid inside one vertically scrolling container.
+     * Cards stay clickable and scrolling is the container's native
+     * behaviour, so a swipe can no longer be mistaken for a card tap: once
+     * the container scrolls, LVGL suppresses CLICKED on the card underneath.
+     */
+    s_card_list = lv_obj_create(s_home);
+    lv_obj_set_pos(s_card_list, LIST_X - 4, LIST_TOP - 4);
+    lv_obj_set_size(s_card_list, LIST_W + 8, LIST_BOTTOM - LIST_TOP + 8);
+    lv_obj_set_style_bg_opa(s_card_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_card_list, 0, 0);
+    lv_obj_set_style_radius(s_card_list, 0, 0);
+    lv_obj_set_style_pad_all(s_card_list, 0, 0);
+    lv_obj_set_style_pad_row(s_card_list, CARD_GAP, 0);
+    lv_obj_set_style_pad_column(s_card_list, CARD_GAP, 0);
+    lv_obj_set_flex_flow(s_card_list, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_add_flag(s_card_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(s_card_list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_scroll_dir(s_card_list, LV_DIR_VER);
+
+    /* reusable card rows; content is filled/cleared by refresh_home() */
+    for (int i = 0; i < VISIBLE_ROWS; i++) {
         cell_t *c = &s_cells[i];
-        c->card = lv_obj_create(s_home);
-        lv_obj_set_pos(c->card, CARD_POS[i].x, CARD_POS[i].y);
-        lv_obj_set_size(c->card, CARD_POS[i].w, CARD_POS[i].h);
+        c->card = lv_obj_create(s_card_list);
+        lv_obj_set_size(c->card, CARD_W, CARD_H);
         lv_obj_set_style_bg_color(c->card, lv_color_hex(COLOR_CARD), 0);
         lv_obj_set_style_bg_opa(c->card, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(c->card, 14, 0);
+        lv_obj_set_style_radius(c->card, 10, 0);
         lv_obj_set_style_pad_all(c->card, 0, 0);
         lv_obj_clear_flag(c->card, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(c->card, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(c->card, on_card, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_add_event_cb(c->card, on_card, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
 
+        /* compact cell: state badge + name on top, agent/pane underneath */
         c->shape = lv_obj_create(c->card);
-        lv_obj_set_pos(c->shape, 12, 14);
-        lv_obj_set_size(c->shape, 28, 28);
-        lv_obj_set_style_radius(c->shape, 14, 0);
+        lv_obj_set_pos(c->shape, 8, 7);
+        lv_obj_set_size(c->shape, 18, 18);
+        lv_obj_set_style_radius(c->shape, 9, 0);
         lv_obj_set_style_bg_opa(c->shape, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(c->shape, 0, 0);
         lv_obj_clear_flag(c->shape, LV_OBJ_FLAG_SCROLLABLE);
@@ -562,34 +859,34 @@ static void build_home(void)
         lv_obj_set_style_text_color(c->shape_lbl, lv_color_hex(COLOR_BG), 0);
         lv_obj_center(c->shape_lbl);
 
-        c->name = ui_label(c->card, 48, 12, CARD_POS[i].w - 60, "---", 20, COLOR_TEXT);
-        c->status = ui_label(c->card, 12, 52, CARD_POS[i].w - 24, "", 24, COLOR_UNKNOWN);
+        c->name = ui_label(c->card, 32, 6, CARD_W - 40, "---", 16, COLOR_TEXT);
+        c->status = ui_label(c->card, 32, 26, CARD_W - 40, "", 14, COLOR_UNKNOWN);
 
         c->icon = lv_image_create(c->card);
-        lv_obj_set_pos(c->icon, 12, 86);
+        lv_obj_set_pos(c->icon, 9, 50);
         lv_image_set_scale(c->icon, 512);   /* 2x nearest: keeps the 8-bit look */
 
-        c->agent = ui_label(c->card, 54, 94, CARD_POS[i].w - 66, "", 14, COLOR_DIM);
-        c->pane = ui_label(c->card, 12, CARD_POS[i].h - 28, CARD_POS[i].w - 24, "", 12, COLOR_DISABLED);
+        c->agent = ui_label(c->card, 32, 50, CARD_W - 40, "", 12, COLOR_DIM);
+        c->pane = ui_label(c->card, 8, CARD_H - 20, CARD_W - 16, "", 12,
+                           COLOR_DISABLED);
+        lv_obj_set_style_text_align(c->pane, LV_TEXT_ALIGN_RIGHT, 0);
+        c->terminal_id[0] = '\0';
+        c->last_status = PANEL_AGENT_UNKNOWN;
+        c->alert_start_ms = 0;
+        lv_obj_add_flag(c->card, LV_OBJ_FLAG_HIDDEN);
     }
+    s_cell_count = VISIBLE_ROWS;
 
     /* empty state (0 sessions) */
     s_empty_label = ui_label(s_home, 40, 200, 400, "暂无活跃会话", 24, COLOR_DIM);
     lv_obj_set_style_text_align(s_empty_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* bottom bar: page indicator + swipe hint (no buttons, gesture nav) */
-    s_sound_notice = ui_label(s_home, 16, 411, 448, "", 14, COLOR_PENDING);
-    s_page_label = ui_label(s_home, 16, 436, 120, "第 1/1 页", 18, COLOR_DIM);
-    s_total_label = ui_label(s_home, 160, 436, 160, "共 0 个", 18, COLOR_DIM);
-    lv_obj_t *hint = ui_label(s_home, 330, 436, 134, LV_SYMBOL_LEFT " swipe " LV_SYMBOL_RIGHT,
+    /* bottom row: transient notice + session total (no page counter) */
+    s_sound_notice = ui_label(s_home, 16, 406, 448, "", 14, COLOR_PENDING);
+    lv_obj_t *hint = ui_label(s_home, 16, 438, 448, LV_SYMBOL_UP " scroll " LV_SYMBOL_DOWN,
                               16, COLOR_DISABLED);
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_RIGHT, 0);
-
-    /* touch navigation: swipe left/right to turn pages; let gestures that
-     * start on any child widget bubble up to this screen */
-    lv_obj_add_event_cb(s_home, on_home_gesture, LV_EVENT_GESTURE, NULL);
-    bubble_gestures(s_home);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
 }
 
 static void fill_cell(int slot, const panel_agent_card_t *a)
@@ -658,7 +955,7 @@ static void update_alert_pulses(void)
 {
     panel_prefs_t p;
     panel_prefs_get(&p);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < s_cell_count; i++) {
         cell_t *c = &s_cells[i];
         if (c->alert_start_ms == 0) continue;
         int64_t age = ui_now_ms() - c->alert_start_ms;
@@ -673,7 +970,7 @@ static void update_alert_pulses(void)
     }
 }
 
-static void refresh_home(const panel_agent_card_t cards[4], int count,
+static void refresh_home(const panel_agent_card_t *cards, int count,
                          int total, panel_conn_state_t conn)
 {
     lv_label_set_text(s_conn_badge, panel_conn_state_name(conn));
@@ -684,20 +981,17 @@ static void refresh_home(const panel_agent_card_t cards[4], int count,
     snprintf(buf, sizeof(buf), "待处理 %d", panel_store_blocked_count());
     lv_label_set_text(s_pending_count, buf);
 
-    int pages = (count + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (pages < 1) pages = 1;
-
-    snprintf(buf, sizeof(buf), "第 %d/%d 页", s_page + 1, pages);
-    lv_label_set_text(s_page_label, buf);
-    snprintf(buf, sizeof(buf), "共 %d 个", total);
-    lv_label_set_text(s_total_label, buf);
+    /* No page counter any more: the list scrolls. The total still matters
+     * because the store caps the overview, so say how many are listed. */
+    snprintf(buf, sizeof(buf), "共 %d 个会话", total);
+    lv_label_set_text(s_sound_notice, buf);
     char notice[PANEL_MESSAGE_LEN];
     panel_store_get_sound_notice(notice, sizeof(notice));
-    lv_label_set_text(s_sound_notice, notice);
+    if (notice[0] != '\0') lv_label_set_text(s_sound_notice, notice);
 
     if (count == 0) {
         lv_obj_clear_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < s_cell_count; i++) {
             lv_obj_add_flag(s_cells[i].card, LV_OBJ_FLAG_HIDDEN);
             s_cells[i].terminal_id[0] = '\0';
             s_cells[i].last_status = PANEL_AGENT_UNKNOWN;
@@ -707,12 +1001,18 @@ static void refresh_home(const panel_agent_card_t cards[4], int count,
     }
     lv_obj_add_flag(s_empty_label, LV_OBJ_FLAG_HIDDEN);
 
-    for (int i = 0; i < 4; i++) {
-        lv_obj_clear_flag(s_cells[i].card, LV_OBJ_FLAG_HIDDEN);
-        if (cards[i].terminal_id[0] != '\0') {
+    /* Bind the first `count` rows. Rows beyond the pool size are not shown;
+     * the store already caps the overview at PANEL_MAX_AGENTS. */
+    int rows = count < s_cell_count ? count : s_cell_count;
+    for (int i = 0; i < s_cell_count; i++) {
+        if (i < rows) {
+            lv_obj_clear_flag(s_cells[i].card, LV_OBJ_FLAG_HIDDEN);
             fill_cell(i, &cards[i]);
         } else {
-            fill_cell(i, NULL);
+            lv_obj_add_flag(s_cells[i].card, LV_OBJ_FLAG_HIDDEN);
+            s_cells[i].terminal_id[0] = '\0';
+            s_cells[i].last_status = PANEL_AGENT_UNKNOWN;
+            s_cells[i].alert_start_ms = 0;
         }
     }
 }
@@ -737,9 +1037,38 @@ static void build_detail(void)
     s_det_project = ui_label(s_detail, 16, 104, 280, "", 18, COLOR_DIM);
     s_det_updated = ui_label(s_detail, 300, 80, 164, "", 16, COLOR_DISABLED);
 
+    /* Action icons (UI_DESIGN.md §4.2): three fixed slots in the upper half.
+     * A slot lights up only when the gateway offered that choice in
+     * `choices`; unavailable slots stay dimmed and inert. The board has no
+     * application buttons (every GPIO is taken by LCD/I2C/touch/I2S), so
+     * tapping a slot is the only way to act. */
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *slot = lv_button_create(s_detail);
+        lv_obj_set_pos(slot, 148 + i * 64, 108);
+        lv_obj_set_size(slot, 56, 56);
+        lv_obj_set_style_bg_color(slot, lv_color_hex(COLOR_CARD), 0);
+        lv_obj_set_style_bg_opa(slot, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(slot, 28, 0);
+        lv_obj_set_style_border_width(slot, 2, 0);
+        lv_obj_set_style_border_color(slot, lv_color_hex(COLOR_BORDER), 0);
+        lv_obj_add_flag(slot, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(slot, on_action_btn, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+        lv_obj_t *glyph = lv_label_create(slot);
+        lv_label_set_text(glyph, "");
+        lv_obj_set_style_text_font(glyph, ui_font(24), 0);
+        lv_obj_set_style_text_color(glyph, lv_color_hex(COLOR_DISABLED), 0);
+        lv_obj_center(glyph);
+        s_act_slot[i] = slot;
+        s_act_glyph[i] = glyph;
+    }
+    lv_obj_t *act_cap = ui_label(s_detail, 16, 168, 448, "", 14, COLOR_DISABLED);
+    lv_obj_set_style_text_align(act_cap, LV_TEXT_ALIGN_CENTER, 0);
+    s_det_act_caption = act_cap;
+
     s_det_content = lv_obj_create(s_detail);
-    lv_obj_set_pos(s_det_content, 16, 140);
-    lv_obj_set_size(s_det_content, 448, 176);
+    lv_obj_set_pos(s_det_content, 16, 192);
+    lv_obj_set_size(s_det_content, 448, 232);
     lv_obj_set_style_bg_color(s_det_content, lv_color_hex(COLOR_CARD), 0);
     lv_obj_set_style_bg_opa(s_det_content, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_det_content, 12, 0);
@@ -747,24 +1076,100 @@ static void build_detail(void)
     lv_obj_set_style_border_width(s_det_content, 1, 0);
     lv_obj_set_style_pad_all(s_det_content, 12, 0);
 
-    /* action area: 16,332,448,88 — 2 buttons, or 3 when allow_always exists */
-    s_btn_allow = ui_button(s_detail, 16, 332, 220, 88, "允许一次", COLOR_DONE, 22);
-    s_btn_deny = ui_button(s_detail, 244, 332, 220, 88, "拒绝", COLOR_PENDING, 22);
-    s_btn_always = ui_button(s_detail, 324, 332, 140, 88, "始终允许", COLOR_WORKING, 18);
-    s_btn_continue = ui_button(s_detail, 16, 332, 448, 88, "继续", COLOR_ACCENT, 22);
-    s_btn_host = ui_button(s_detail, 16, 332, 448, 88, "请在主机处理", COLOR_BORDER, 20);
-    lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(s_btn_allow, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_ALLOW_ONCE);
-    lv_obj_add_event_cb(s_btn_deny, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_DENY);
-    lv_obj_add_event_cb(s_btn_always, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_ALLOW_ALWAYS);
-    lv_obj_add_event_cb(s_btn_continue, on_action_btn, LV_EVENT_CLICKED, (void *)(intptr_t)PANEL_ACT_CONTINUE);
-    lv_obj_add_event_cb(s_btn_host, on_refresh, LV_EVENT_CLICKED, NULL);
+    s_det_hint = ui_label(s_detail, 16, 434, 448, "操作前请确认", 16, COLOR_DIM);
+    lv_obj_set_style_text_align(s_det_hint, LV_TEXT_ALIGN_CENTER, 0);
+}
 
-    s_det_hint = ui_label(s_detail, 16, 432, 448, "操作前请确认", 18, COLOR_DIM);
+/*
+ * Layout self-test for the CJK-blank symptom. Glyph lookup is proven healthy
+ * by log_font_probe(), so this reports the geometry instead: if a label's
+ * height collapses or the text is clipped away, that is why the Chinese line
+ * renders blank while Latin (narrower, fewer wrapped rows) fits.
+ */
+static void log_detail_layout(lv_obj_t *parent, const char *what)
+{
+    uint32_t n = lv_obj_get_child_count(parent);
+    ESP_LOGI(TAG, "layout[%s] children=%u parent=%dx%d", what, (unsigned)n,
+             (int)lv_obj_get_width(parent), (int)lv_obj_get_height(parent));
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *c = lv_obj_get_child(parent, (int32_t)i);
+        if (c == NULL) continue;
+        ESP_LOGI(TAG, "  child%u %dx%d at (%d,%d)",
+                 (unsigned)i, (int)lv_obj_get_width(c), (int)lv_obj_get_height(c),
+                 (int)lv_obj_get_x(c), (int)lv_obj_get_y(c));
+    }
+}
+
+/*
+ * Action slots (UI_DESIGN.md §4.2). Slot meaning depends on whether the
+ * gateway is asking for a decision:
+ *   approval/question           -> [allow once] [deny] [allow all]
+ *   idle/done, nothing to decide -> [continue] [stop] [auto]
+ * A slot lights up only when the gateway actually offered that choice, so the
+ * firmware never offers a request the gateway would reject. STOP is absent
+ * from the gateway's Action literal (refer/herdr-restful/backend/app/panel/
+ * view_models.py) and therefore stays dimmed with a "press Esc on the host"
+ * caption until the gateway grows support for it.
+ */
+static panel_action_id_t s_act_action[3];
+
+static void set_act_slot(int i, const char *glyph, uint32_t color, bool on)
+{
+    lv_label_set_text(s_act_glyph[i], glyph);
+    if (on) {
+        lv_obj_set_style_bg_color(s_act_slot[i], lv_color_hex(color), 0);
+        lv_obj_set_style_text_color(s_act_glyph[i], lv_color_hex(COLOR_BG), 0);
+        lv_obj_set_style_border_color(s_act_slot[i], lv_color_hex(color), 0);
+        lv_obj_remove_state(s_act_slot[i], LV_STATE_DISABLED);
+    } else {
+        lv_obj_set_style_bg_color(s_act_slot[i], lv_color_hex(COLOR_CARD), 0);
+        lv_obj_set_style_border_color(s_act_slot[i], lv_color_hex(COLOR_BORDER), 0);
+        lv_obj_set_style_text_color(s_act_glyph[i], lv_color_hex(COLOR_DISABLED), 0);
+        lv_obj_add_state(s_act_slot[i], LV_STATE_DISABLED);
+    }
+}
+
+static void dim_act_slots(void)
+{
+    static const char *const glyphs[3] = {
+        LV_SYMBOL_OK, LV_SYMBOL_CLOSE, LV_SYMBOL_SETTINGS
+    };
+    for (int i = 0; i < 3; i++) {
+        set_act_slot(i, glyphs[i], COLOR_DISABLED, false);
+        s_act_action[i] = PANEL_ACT_NONE;
+    }
+    lv_label_set_text(s_det_act_caption, "");
+}
+
+static void render_action_slots(const panel_detail_t *det, uint8_t choices,
+                                bool online)
+{
+    bool deciding = det->pending.kind == PANEL_PENDING_APPROVAL ||
+                    det->pending.kind == PANEL_PENDING_QUESTION;
+
+    if (deciding) {
+        set_act_slot(0, LV_SYMBOL_OK, COLOR_DONE,
+                     (choices & PANEL_CHOICE_ALLOW_ONCE) != 0);
+        set_act_slot(1, LV_SYMBOL_CLOSE, COLOR_PENDING,
+                     (choices & PANEL_CHOICE_DENY) != 0);
+        set_act_slot(2, LV_SYMBOL_SETTINGS, COLOR_WORKING,
+                     (choices & PANEL_CHOICE_ALLOW_ALWAYS) != 0);
+        s_act_action[0] = PANEL_ACT_ALLOW_ONCE;
+        s_act_action[1] = PANEL_ACT_DENY;
+        s_act_action[2] = PANEL_ACT_ALLOW_ALWAYS;
+        lv_label_set_text(s_det_act_caption, "点击图标确认操作");
+    } else {
+        set_act_slot(0, LV_SYMBOL_PLAY, COLOR_ACCENT,
+                     (choices & PANEL_CHOICE_CONTINUE) != 0);
+        set_act_slot(1, LV_SYMBOL_CLOSE, COLOR_PENDING, false);
+        set_act_slot(2, LV_SYMBOL_REFRESH, COLOR_WORKING,
+                     (choices & PANEL_CHOICE_ALLOW_ALWAYS) != 0);
+        s_act_action[0] = PANEL_ACT_CONTINUE;
+        s_act_action[1] = PANEL_ACT_STOP;       /* no gateway action yet */
+        s_act_action[2] = PANEL_ACT_ALLOW_ALWAYS;
+        lv_label_set_text(s_det_act_caption, "停止请在主机按 Esc");
+    }
+    (void)online;
 }
 
 static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
@@ -779,11 +1184,7 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
         lv_obj_clean(s_det_content);
         ui_label(s_det_content, 0, 60, 424, "会话已结束，请返回列表",
                  18, COLOR_DISABLED);
-        lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+        dim_act_slots();
         lv_label_set_text(s_det_hint, "会话已结束");
         return;
     }
@@ -806,8 +1207,20 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
     lv_obj_set_style_text_color(s_det_updated,
         lv_color_hex(age_s > 6 ? COLOR_PENDING : COLOR_DISABLED), 0);
 
-    /* content: pending card first, else output lines */
+    /* content: pending card first, else output lines.
+     *
+     * Rows are laid out by the container's flex column, not by absolute
+     * lv_obj_set_pos(). Absolute positioning needed a guessed height per
+     * label; without one, LVGL left every label at 0x0 / (-1,-1) and drew
+     * nothing at all, which is why CJK text looked blank here while Latin
+     * text elsewhere rendered fine (the glyph data was always correct). */
     lv_obj_clean(s_det_content);
+    lv_obj_set_flex_flow(s_det_content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_det_content, 8, 0);
+    lv_obj_set_style_pad_all(s_det_content, 12, 0);
+    lv_obj_set_scroll_dir(s_det_content, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_det_content, LV_SCROLLBAR_MODE_AUTO);
+
     if (det->pending.kind != PANEL_PENDING_NONE && det->pending.summary[0] != '\0') {
         lv_obj_t *sum = lv_label_create(s_det_content);
         lv_label_set_long_mode(sum, LV_LABEL_LONG_WRAP);
@@ -815,7 +1228,6 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
         lv_label_set_text(sum, det->pending.summary);
         lv_obj_set_style_text_font(sum, ui_font(20), 0);
         lv_obj_set_style_text_color(sum, lv_color_hex(COLOR_TEXT), 0);
-        lv_obj_set_pos(sum, 0, 0);
 
         if (det->pending.impact[0] != '\0') {
             lv_obj_t *imp = lv_label_create(s_det_content);
@@ -824,7 +1236,6 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
             lv_label_set_text(imp, det->pending.impact);
             lv_obj_set_style_text_font(imp, ui_font(18), 0);
             lv_obj_set_style_text_color(imp, lv_color_hex(COLOR_DIM), 0);
-            lv_obj_set_pos(imp, 0, 72);
         }
 
         if (det->pending.kind == PANEL_PENDING_CONTINUATION &&
@@ -836,22 +1247,23 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
             lv_label_set_text(pr, det->pending.prompt);
             lv_obj_set_style_text_font(pr, ui_font(18), 0);
             lv_obj_set_style_text_color(pr, lv_color_hex(COLOR_ACCENT), 0);
-            lv_obj_set_pos(pr, 0, 120);
         }
     } else {
         for (int i = 0; i < det->output_line_count; i++) {
             lv_obj_t *ln = lv_label_create(s_det_content);
             lv_label_set_long_mode(ln, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(ln, 424);
+            lv_obj_set_width(ln, 400);
+            lv_obj_set_height(ln, 20);   /* fixed: LONG_DOT requires a height */
             lv_label_set_text(ln, det->output_lines[i]);
             lv_obj_set_style_text_font(ln, ui_font(16), 0);
             lv_obj_set_style_text_color(ln, lv_color_hex(COLOR_DIM), 0);
-            lv_obj_set_pos(ln, 0, i * 20);
         }
         if (det->output_line_count == 0) {
-            ui_label(s_det_content, 0, 60, 424, "(no output)", 18, COLOR_DISABLED);
+            ui_label(s_det_content, 0, 0, 400, "(no output)", 18, COLOR_DISABLED);
         }
     }
+
+    log_detail_layout(s_det_content, "det_content");
 
     /* action visibility from gateway choices only; actions need fresh data:
      * spec §4.3 — >6 s marks stale, >10 s disables actions entirely */
@@ -859,73 +1271,24 @@ static void render_detail(const panel_detail_t *det, panel_conn_state_t conn,
     bool fresh = det->valid && online && age_s <= 10;
     uint8_t choices = fresh ? det->pending.choices : 0;
 
-    lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-
     if (panel_store_action_reserved()) {
-        lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "操作进行中");
-        lv_label_set_text(s_det_hint, "请等待当前操作");
-        return;
-    }
-
-    if (online && age_s > 10) {
-        lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "数据已过期");
-        lv_label_set_text(s_det_hint, "正在刷新，操作已禁用");
-        return;
-    }
-
-    if (det->pending.kind == PANEL_PENDING_APPROVAL ||
-        det->pending.kind == PANEL_PENDING_QUESTION) {
-        bool has_allow = (choices & PANEL_CHOICE_ALLOW_ONCE) != 0;
-        bool has_always = (choices & PANEL_CHOICE_ALLOW_ALWAYS) != 0;
-        bool has_deny = (choices & PANEL_CHOICE_DENY) != 0;
-        if (has_allow && has_deny && has_always) {
-            /* 3-button layout: 146 / 146 / 140 */
-            lv_obj_set_pos(s_btn_allow, 16, 332);
-            lv_obj_set_size(s_btn_allow, 146, 88);
-            lv_obj_set_pos(s_btn_deny, 170, 332);
-            lv_obj_set_size(s_btn_deny, 146, 88);
-            lv_obj_clear_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(s_det_hint, "始终允许需再次确认");
-        } else if (has_allow || has_deny) {
-            /* 2-button layout */
-            lv_obj_set_pos(s_btn_allow, 16, 332);
-            lv_obj_set_size(s_btn_allow, 220, 88);
-            lv_obj_set_pos(s_btn_deny, 244, 332);
-            lv_obj_set_size(s_btn_deny, 220, 88);
-            if (has_allow) lv_obj_clear_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
-            if (has_deny) lv_obj_clear_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(s_det_hint, age_s > 6 ? "数据已过期" : "操作前请确认");
-        } else {
-            lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "请在主机处理");
-            lv_label_set_text(s_det_hint, "影响或选项不完整");
-        }
-    } else if ((det->herdr_status == PANEL_AGENT_IDLE ||
-                det->herdr_status == PANEL_AGENT_DONE) &&
-               (choices & PANEL_CHOICE_CONTINUE)) {
-        lv_obj_clear_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_det_hint, age_s > 6 ? "数据已过期" : "确认页展示完整提示");
-    } else if (det->pending.kind == PANEL_PENDING_UNRECOGNIZED ||
-               det->herdr_status == PANEL_AGENT_BLOCKED) {
-        lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "请在主机处理");
-        lv_label_set_text(s_det_hint, "无法识别当前请求");
-    } else if (!online) {
-        lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "离线，操作已禁用");
-        lv_label_set_text(s_det_hint, "重连后才能操作");
+        dim_act_slots();
+        lv_label_set_text(s_det_hint, "操作进行中，请等待");
+    } else if (online && age_s > 10) {
+        dim_act_slots();
+        lv_label_set_text(s_det_hint, "数据已过期，正在刷新");
     } else {
-        lv_obj_clear_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(lv_obj_get_child(s_btn_host, 0), "暂无可用操作");
-        lv_label_set_text(s_det_hint, "请在主机处理");
+        render_action_slots(det, choices, online);
+        if (!online) {
+            lv_label_set_text(s_det_hint, "重连后才能操作");
+        } else if (det->pending.kind == PANEL_PENDING_UNRECOGNIZED ||
+                   det->herdr_status == PANEL_AGENT_BLOCKED) {
+            lv_label_set_text(s_det_hint, "无法识别请求，请在主机处理");
+        } else if (age_s > 6) {
+            lv_label_set_text(s_det_hint, "数据可能已过期");
+        } else {
+            lv_label_set_text(s_det_hint, "操作前请确认");
+        }
     }
 }
 
@@ -1108,7 +1471,7 @@ static void build_settings(void)
 
     lv_obj_t *back = ui_button(s_settings, 8, 8, 56, 48, LV_SYMBOL_LEFT, COLOR_CARD, 22);
     lv_obj_add_event_cb(back, on_back, LV_EVENT_CLICKED, NULL);
-    ui_label(s_settings, 80, 20, 300, "设置", 24, COLOR_TEXT);
+    ui_label(s_settings, 80, 20, 300, "Settings", 24, COLOR_TEXT);
 
     lv_obj_t *list = lv_obj_create(s_settings);
     lv_obj_set_pos(list, 8, 72);
@@ -1117,9 +1480,9 @@ static void build_settings(void)
     lv_obj_set_style_border_width(list, 0, 0);
     lv_obj_set_style_pad_all(list, 0, 0);
     static const struct { const char *name; screen_t target; } items[] = {
-        { "声音", SCR_SOUND }, { "显示", SCR_DISPLAY },
-        { "会话", SCR_SESSIONS }, { "连接", SCR_CONNECTION },
-        { "关于", SCR_ABOUT }, { "重新配网", SCR_REPROVISION_CONFIRM },
+        { "Sound", SCR_SOUND }, { "Display", SCR_DISPLAY },
+        { "Sessions", SCR_SESSIONS }, { "Connection", SCR_CONNECTION },
+        { "About", SCR_ABOUT }, { "Reprovision", SCR_REPROVISION_CONFIRM },
     };
     for (int i = 0; i < 6; i++) {
         lv_obj_t *b = ui_button(list, 8, i * 78, 448, 72, items[i].name,
@@ -1127,7 +1490,7 @@ static void build_settings(void)
         lv_obj_add_event_cb(b, on_settings_nav, LV_EVENT_CLICKED,
                             (void *)(intptr_t)items[i].target);
     }
-    lv_obj_t *home = ui_button(s_settings, 16, 424, 448, 48, "返回首页", COLOR_CARD, 18);
+    lv_obj_t *home = ui_button(s_settings, 16, 424, 448, 48, "Back to Home", COLOR_CARD, 18);
     lv_obj_add_event_cb(home, on_back, LV_EVENT_CLICKED, NULL);
 }
 
@@ -1145,16 +1508,22 @@ static lv_obj_t *make_pref_page(const char *title, screen_t parent)
     return scr;
 }
 
-static lv_obj_t *add_pref_button(lv_obj_t *scr, int y,
-                                  const char *name, panel_pref_field_t field)
+static lv_obj_t *add_pref_button_h(lv_obj_t *scr, int y, int h,
+                                   const char *name, panel_pref_field_t field)
 {
-    lv_obj_t *b = ui_button(scr, 16, y, 448, 68, name, COLOR_CARD, 20);
+    lv_obj_t *b = ui_button(scr, 16, y, 448, h, name, COLOR_CARD, 20);
     lv_obj_add_event_cb(b, on_pref_click, LV_EVENT_CLICKED,
                         (void *)(intptr_t)(field + 1));
     if (s_pref_widget_count < (int)(sizeof(s_pref_widgets) / sizeof(s_pref_widgets[0]))) {
         s_pref_widgets[s_pref_widget_count++] = (pref_widget_t){ b, field, name };
     }
     return b;
+}
+
+static lv_obj_t *add_pref_button(lv_obj_t *scr, int y,
+                                  const char *name, panel_pref_field_t field)
+{
+    return add_pref_button_h(scr, y, 68, name, field);
 }
 
 static lv_obj_t *add_pref_slider(lv_obj_t *scr, int y,
@@ -1173,101 +1542,110 @@ static lv_obj_t *add_pref_slider(lv_obj_t *scr, int y,
     return slider;
 }
 
+/* Language policy (UI_DESIGN.md §2): session-facing screens (home grid,
+ * detail, confirm, result) stay Chinese because they carry session and agent
+ * status text. Settings screens are English-only so they never depend on the
+ * generated CJK font cut, which keeps them legible on a truncated subset. */
 static void build_pref_pages(void)
 {
-    s_quick = make_pref_page("快捷设置", SCR_HOME);
-    add_pref_button(s_quick, 80, "声音", PANEL_PREF_SOUND_ENABLED);
-    s_quick_brightness = add_pref_slider(s_quick, 174, "亮度", PANEL_PREF_BRIGHTNESS, 10, 100);
-    lv_obj_t *all = ui_button(s_quick, 16, 292, 448, 80, "全部设置", COLOR_ACCENT, 22);
+    s_quick = make_pref_page("Quick Settings", SCR_HOME);
+    add_pref_button(s_quick, 80, "Sound", PANEL_PREF_SOUND_ENABLED);
+    s_quick_brightness = add_pref_slider(s_quick, 174, "Brightness", PANEL_PREF_BRIGHTNESS, 10, 100);
+    lv_obj_t *all = ui_button(s_quick, 16, 292, 448, 80, "All Settings", COLOR_ACCENT, 22);
     lv_obj_add_event_cb(all, on_settings_nav, LV_EVENT_CLICKED,
                         (void *)(intptr_t)SCR_SETTINGS);
 
-    s_sound = make_pref_page("声音", SCR_SETTINGS);
+    s_sound = make_pref_page("Sound", SCR_SETTINGS);
     s_sound_status = s_pref_status[s_pref_status_count - 1];
-    add_pref_button(s_sound, 76, "声音", PANEL_PREF_SOUND_ENABLED);
-    s_sound_volume = add_pref_slider(s_sound, 156, "音量", PANEL_PREF_SOUND_VOLUME, 0, 100);
+    add_pref_button(s_sound, 76, "Sound", PANEL_PREF_SOUND_ENABLED);
+    s_sound_volume = add_pref_slider(s_sound, 156, "Volume", PANEL_PREF_SOUND_VOLUME, 0, 100);
     lv_obj_t *test_request = ui_button(s_sound, 16, 215, 214, 36,
-                                       "试听请求音", COLOR_BORDER, 16);
+                                       "Test Input", COLOR_BORDER, 16);
     lv_obj_t *test_done = ui_button(s_sound, 250, 215, 214, 36,
-                                    "试听完成音", COLOR_BORDER, 16);
+                                    "Test Done", COLOR_BORDER, 16);
     lv_obj_add_event_cb(test_request, on_sound_test, LV_EVENT_CLICKED,
                         (void *)(intptr_t)PANEL_AUDIO_REQUEST);
     lv_obj_add_event_cb(test_done, on_sound_test, LV_EVENT_CLICKED,
                         (void *)(intptr_t)PANEL_AUDIO_DONE);
-    add_pref_button(s_sound, 256, "需要输入", PANEL_PREF_SOUND_REQUEST);
-    add_pref_button(s_sound, 330, "任务完成", PANEL_PREF_SOUND_DONE);
-    lv_obj_t *more = ui_button(s_sound, 16, 404, 448, 36, "更多声音设置", COLOR_BORDER, 16);
+    add_pref_button(s_sound, 256, "On Input", PANEL_PREF_SOUND_REQUEST);
+    add_pref_button(s_sound, 330, "On Done", PANEL_PREF_SOUND_DONE);
+    lv_obj_t *more = ui_button(s_sound, 16, 404, 448, 36, "More Sound Options", COLOR_BORDER, 16);
     lv_obj_add_event_cb(more, on_settings_nav, LV_EVENT_CLICKED,
                         (void *)(intptr_t)SCR_SOUND_MORE);
 
-    s_sound_more = make_pref_page("声音选项", SCR_SOUND);
-    add_pref_button(s_sound_more, 76, "提醒范围", PANEL_PREF_SOUND_SCOPE);
+    s_sound_more = make_pref_page("Sound Options", SCR_SOUND);
+    add_pref_button(s_sound_more, 76, "Alert Scope", PANEL_PREF_SOUND_SCOPE);
     add_pref_button(s_sound_more, 150, "Claude", PANEL_PREF_SOUND_CLAUDE);
     add_pref_button(s_sound_more, 224, "OpenCode", PANEL_PREF_SOUND_OPENCODE);
     add_pref_button(s_sound_more, 298, "Pi", PANEL_PREF_SOUND_PI);
-    lv_obj_t *quiet = ui_button(s_sound_more, 16, 372, 448, 68, "免打扰", COLOR_CARD, 20);
+    lv_obj_t *quiet = ui_button(s_sound_more, 16, 372, 448, 68, "Quiet Hours", COLOR_CARD, 20);
     lv_obj_add_event_cb(quiet, on_settings_nav, LV_EVENT_CLICKED,
                         (void *)(intptr_t)SCR_QUIET);
 
-    s_quiet = make_pref_page("免打扰", SCR_SOUND_MORE);
-    add_pref_button(s_quiet, 76, "已启用", PANEL_PREF_QUIET_ENABLED);
-    add_pref_button(s_quiet, 150, "开始（+15 分）", PANEL_PREF_QUIET_START);
-    add_pref_button(s_quiet, 224, "结束（+15 分）", PANEL_PREF_QUIET_END);
-    add_pref_button(s_quiet, 298, "时区偏移（+15 分）", PANEL_PREF_UTC_OFFSET);
+    s_quiet = make_pref_page("Quiet Hours", SCR_SOUND_MORE);
+    add_pref_button(s_quiet, 76, "Enabled", PANEL_PREF_QUIET_ENABLED);
+    add_pref_button(s_quiet, 150, "Start (+15 min)", PANEL_PREF_QUIET_START);
+    add_pref_button(s_quiet, 224, "End (+15 min)", PANEL_PREF_QUIET_END);
+    add_pref_button(s_quiet, 298, "UTC Offset (+15 min)", PANEL_PREF_UTC_OFFSET);
     s_quiet_note = ui_label(s_quiet, 20, 382, 440, "", 16, COLOR_PENDING);
 
-    s_display = make_pref_page("显示", SCR_SETTINGS);
-    s_display_brightness = add_pref_slider(s_display, 72, "亮度", PANEL_PREF_BRIGHTNESS, 10, 100);
-    add_pref_button(s_display, 166, "闲置降亮", PANEL_PREF_IDLE_DIM_SECONDS);
-    add_pref_button(s_display, 236, "降亮后亮度", PANEL_PREF_DIM_BRIGHTNESS);
-    add_pref_button(s_display, 306, "减少动画", PANEL_PREF_REDUCE_MOTION);
-    add_pref_button(s_display, 376, "视觉提醒", PANEL_PREF_VISUAL_ALERT);
+    s_display = make_pref_page("Display", SCR_SETTINGS);
+    s_display_brightness = add_pref_slider(s_display, 68, "Brightness", PANEL_PREF_BRIGHTNESS, 10, 100);
+    /* Two new rows replaced the single "Idle Dimming" row, so the buttons go
+     * to 58 px to fit all six plus the slider inside 480 px. */
+    add_pref_button_h(s_display, 152, 58, "Standby Clock", PANEL_PREF_IDLE_DISPLAY_SECONDS);
+    add_pref_button_h(s_display, 214, 58, "Blank Screen", PANEL_PREF_IDLE_BLANK_SECONDS);
+    add_pref_button_h(s_display, 276, 58, "Wake on Motion", PANEL_PREF_MOTION_WAKE);
+    add_pref_button_h(s_display, 338, 58, "Dimmed Level", PANEL_PREF_DIM_BRIGHTNESS);
+    add_pref_button_h(s_display, 400, 58, "Reduce Motion", PANEL_PREF_REDUCE_MOTION);
 
-    s_sessions = make_pref_page("会话", SCR_SETTINGS);
-    add_pref_button(s_sessions, 76, "刷新间隔", PANEL_PREF_OVERVIEW_INTERVAL);
-    add_pref_button(s_sessions, 150, "卡片排序", PANEL_PREF_CARD_ORDER);
-    add_pref_button(s_sessions, 224, "隐藏空闲", PANEL_PREF_HIDE_IDLE);
+    s_sessions = make_pref_page("Sessions", SCR_SETTINGS);
+    add_pref_button(s_sessions, 76, "Refresh Interval", PANEL_PREF_OVERVIEW_INTERVAL);
+    add_pref_button(s_sessions, 150, "Card Order", PANEL_PREF_CARD_ORDER);
+    add_pref_button(s_sessions, 224, "Hide Idle", PANEL_PREF_HIDE_IDLE);
+    /* Lived on the Display page until standby took two of its rows. */
+    add_pref_button(s_sessions, 298, "Visual Alerts", PANEL_PREF_VISUAL_ALERT);
     app_config_t session_cfg;
     app_config_get(&session_cfg);
     char prompt_summary[224];
-    snprintf(prompt_summary, sizeof(prompt_summary), "继续提示词：%s",
-             session_cfg.continue_prompt[0] ? session_cfg.continue_prompt : "网关默认");
-    ui_label(s_sessions, 24, 305, 432, prompt_summary, 18, COLOR_DIM);
-    lv_obj_t *edit_prompt = ui_button(s_sessions, 16, 348, 448, 76,
-                                      "扫码编辑继续提示词", COLOR_CARD, 20);
+    snprintf(prompt_summary, sizeof(prompt_summary), "Continue prompt: %s",
+             session_cfg.continue_prompt[0] ? session_cfg.continue_prompt : "Gateway default");
+    ui_label(s_sessions, 24, 380, 432, prompt_summary, 18, COLOR_DIM);
+    lv_obj_t *edit_prompt = ui_button(s_sessions, 16, 424, 448, 68,
+                                      "Scan to Edit Continue Prompt", COLOR_CARD, 20);
     lv_obj_add_event_cb(edit_prompt, on_connection_edit, LV_EVENT_CLICKED, NULL);
 
-    s_connection = make_pref_page("连接", SCR_SETTINGS);
+    s_connection = make_pref_page("Connection", SCR_SETTINGS);
     app_config_t cfg;
     app_config_get(&cfg);
     char label[180];
-    snprintf(label, sizeof(label), "Wi-Fi：%s\n网关：%s:%u",
+    snprintf(label, sizeof(label), "Wi-Fi: %s\nGateway: %s:%u",
              cfg.wifi_ssid, cfg.backend_host, (unsigned)cfg.backend_port);
     lv_obj_t *info = ui_label(s_connection, 20, 100, 440, label, 20, COLOR_TEXT);
     lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
     lv_obj_set_height(info, 160);
     s_connection_power = ui_label(s_connection, 20, 235, 440,
-                                  "电量：读取中", 18, COLOR_DIM);
-    lv_obj_t *refresh = ui_button(s_connection, 16, 285, 448, 66, "刷新连接", COLOR_CARD, 20);
+                                  "Battery: reading...", 18, COLOR_DIM);
+    lv_obj_t *refresh = ui_button(s_connection, 16, 285, 448, 66, "Refresh Connection", COLOR_CARD, 20);
     lv_obj_add_event_cb(refresh, on_refresh, LV_EVENT_CLICKED, NULL);
     lv_obj_t *edit_connection = ui_button(s_connection, 16, 365, 448, 66,
-                                          "扫码编辑连接", COLOR_ACCENT, 20);
+                                          "Scan to Edit Connection", COLOR_ACCENT, 20);
     lv_obj_add_event_cb(edit_connection, on_connection_edit, LV_EVENT_CLICKED, NULL);
 
-    s_about = make_pref_page("关于", SCR_SETTINGS);
+    s_about = make_pref_page("About", SCR_SETTINGS);
     ui_label(s_about, 20, 110, 440, "Herdr Panel\nESP-IDF · Panel API v1", 20, COLOR_TEXT);
 
-    s_reprovision = make_pref_page("重新配网？", SCR_SETTINGS);
+    s_reprovision = make_pref_page("Reprovision?", SCR_SETTINGS);
     lv_obj_t *warn = ui_label(s_reprovision, 20, 110, 440,
-                              "清除 Wi-Fi 与网关令牌？\n显示和声音设置会保留。",
+                              "Clear Wi-Fi and gateway token?\nDisplay and sound settings are kept.",
                               20, COLOR_TEXT);
     lv_label_set_long_mode(warn, LV_LABEL_LONG_WRAP);
     lv_obj_set_height(warn, 120);
-    lv_obj_t *cancel = ui_button(s_reprovision, 16, 286, 448, 64, "取消", COLOR_CARD, 20);
+    lv_obj_t *cancel = ui_button(s_reprovision, 16, 286, 448, 64, "Cancel", COLOR_CARD, 20);
     lv_obj_add_event_cb(cancel, on_settings_nav, LV_EVENT_CLICKED,
                         (void *)(intptr_t)SCR_SETTINGS);
     lv_obj_t *confirm = ui_button(s_reprovision, 16, 366, 448, 70,
-                                  "清除连接凭据", COLOR_PENDING, 20);
+                                  "Clear Credentials", COLOR_PENDING, 20);
     lv_obj_add_event_cb(confirm, on_menu, LV_EVENT_CLICKED, (void *)(intptr_t)3);
 }
 
@@ -1281,29 +1659,37 @@ static void refresh_prefs_ui(void)
         int v = panel_prefs_value(&p, w->field);
         const char *value = NULL;
         if (w->field == PANEL_PREF_SOUND_SCOPE) {
-            value = v == PANEL_SOUND_PAGE ? "当前页" :
-                    v == PANEL_SOUND_SELECTED ? "已选会话" : "全部";
+            value = v == PANEL_SOUND_PAGE ? "This Page" :
+                    v == PANEL_SOUND_SELECTED ? "Selected" : "All";
         } else if (w->field == PANEL_PREF_CARD_ORDER) {
-            value = v == PANEL_ORDER_BLOCKED ? "待处理优先" :
-                    v == PANEL_ORDER_RECENT ? "最近更新" : "固定顺序";
+            value = v == PANEL_ORDER_BLOCKED ? "Blocked First" :
+                    v == PANEL_ORDER_RECENT ? "Recently Updated" : "Fixed Order";
         } else if (w->field == PANEL_PREF_SOUND_CLAUDE ||
                    w->field == PANEL_PREF_SOUND_OPENCODE ||
                    w->field == PANEL_PREF_SOUND_PI) {
-            value = v == PANEL_SOUND_ON ? "开" :
-                    v == PANEL_SOUND_OFF ? "关" : "继承";
+            value = v == PANEL_SOUND_ON ? "On" :
+                    v == PANEL_SOUND_OFF ? "Off" : "Inherit";
         } else if (w->field == PANEL_PREF_QUIET_START || w->field == PANEL_PREF_QUIET_END) {
             snprintf(buf, sizeof(buf), "%s  %02d:%02d", w->name, v / 60, v % 60);
         } else if (w->field == PANEL_PREF_UTC_OFFSET) {
             int absv = v < 0 ? -v : v;
             snprintf(buf, sizeof(buf), "%s  %c%02d:%02d", w->name,
                      v < 0 ? '-' : '+', absv / 60, absv % 60);
-        } else if (w->field == PANEL_PREF_OVERVIEW_INTERVAL ||
-                   w->field == PANEL_PREF_IDLE_DIM_SECONDS) {
+        } else if (w->field == PANEL_PREF_OVERVIEW_INTERVAL) {
             snprintf(buf, sizeof(buf), "%s  %d s", w->name, v);
+        } else if (w->field == PANEL_PREF_IDLE_DISPLAY_SECONDS) {
+            snprintf(buf, sizeof(buf), "%s  %s", w->name,
+                     v == 0 ? "Off" : standby_duration(v));
+        } else if (w->field == PANEL_PREF_IDLE_BLANK_SECONDS) {
+            snprintf(buf, sizeof(buf), "%s  %s", w->name,
+                     v == 0 ? "Never" : standby_duration(v));
+        } else if (w->field == PANEL_PREF_MOTION_WAKE) {
+            value = panel_motion_present() ? (v ? "On" : "Off")
+                                           : "No IMU";
         } else if (w->field == PANEL_PREF_DIM_BRIGHTNESS) {
             snprintf(buf, sizeof(buf), "%s  %d%%", w->name, v);
         } else {
-            value = v ? "开" : "关";
+            value = v ? "On" : "Off";
         }
         if (value != NULL) snprintf(buf, sizeof(buf), "%s  %s", w->name, value);
         lv_label_set_text(lv_obj_get_child(w->button, 0), buf);
@@ -1313,10 +1699,10 @@ static void refresh_prefs_ui(void)
     if (s_sound_volume) lv_slider_set_value(s_sound_volume, p.sound_volume, LV_ANIM_OFF);
     if (s_quiet_note) {
         const char *note = p.quiet_enabled && time(NULL) < 1704067200 ?
-            "时间未同步，声音已静音" :
+            "Clock not synced; sound muted" :
             p.quiet_enabled && p.quiet_start == p.quiet_end ?
-            "起止相同：全天静音" :
-            "固定时区偏移；夏令时请手动调整";
+            "Same start and end: muted all day" :
+            "Fixed UTC offset; adjust for daylight saving";
         lv_label_set_text(s_quiet_note, note);
     }
 }
@@ -1418,6 +1804,7 @@ static void show_screen(screen_t s)
     case SCR_ABOUT: scr = s_about; break;
     case SCR_REPROVISION_CONFIRM: scr = s_reprovision; break;
     case SCR_PROVISION: scr = s_prov; break;
+    case SCR_STANDBY: scr = s_standby; break;
     }
     if (scr != NULL) {
         panel_prefs_t p;
@@ -1444,13 +1831,13 @@ static void show_screen(screen_t s)
 static void on_card(lv_event_t *e)
 {
     int slot = (int)(intptr_t)lv_event_get_user_data(e);
-    if (slot < 0 || slot >= 4) return;
+    if (slot < 0 || slot >= s_cell_count) return;
     const char *term = s_cells[slot].terminal_id;
     if (term[0] == '\0') return;
 
     bump_epoch();
     snprintf(s_sel_term, sizeof(s_sel_term), "%s", term);
-    panel_store_set_view_context(s_page, s_sel_term);
+    panel_store_set_view_context(s_sel_term);
 
     panel_cmd_t cmd = {
         .type = PANEL_CMD_OPEN_DETAIL,
@@ -1470,11 +1857,7 @@ static void on_card(lv_event_t *e)
     lv_label_set_text(s_det_hint, "");
     lv_obj_clean(s_det_content);
     ui_label(s_det_content, 0, 60, 424, "加载中…", 18, COLOR_DISABLED);
-    lv_obj_add_flag(s_btn_allow, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_deny, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_always, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_continue, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_btn_host, LV_OBJ_FLAG_HIDDEN);
+    dim_act_slots();
 
     show_screen(SCR_DETAIL);
 }
@@ -1489,13 +1872,14 @@ static void on_menu(lv_event_t *e)
             esp_restart();
         } else {
             for (int i = 0; i < s_pref_status_count; i++) {
-                lv_label_set_text(s_pref_status[i], "清除连接凭据失败");
+                lv_label_set_text(s_pref_status[i], "Failed to clear credentials");
             }
         }
         return;
     }
     if (s_screen == SCR_HOME) {
         refresh_prefs_ui();
+        ensure_settings_pages(SCR_QUICK);
         show_screen(SCR_QUICK);
     }
 }
@@ -1505,7 +1889,7 @@ static void on_connection_edit(lv_event_t *e)
     (void)e;
     panel_cmd_t cmd = { .type = PANEL_CMD_EDIT_CONNECTION };
     const char *msg = panel_store_enqueue_control(&cmd) ?
-                      "正在打开编辑热点…" : "忙碌，请稍后重试";
+                      "Opening edit hotspot…" : "Busy, try again";
     for (int i = 0; i < s_pref_status_count; i++)
         lv_label_set_text(s_pref_status[i], msg);
 }
@@ -1522,7 +1906,7 @@ static void on_back(lv_event_t *e)
     if (s_screen == SCR_DETAIL) {
         bump_epoch();
         s_sel_term[0] = '\0';
-        panel_store_set_view_context(s_page, NULL);
+        panel_store_set_view_context(NULL);
         /* tell the worker to stop polling this detail */
         panel_cmd_t cmd = { .type = PANEL_CMD_CLOSE_DETAIL };
         panel_store_enqueue_control(&cmd);
@@ -1535,10 +1919,51 @@ static void on_back(lv_event_t *e)
     }
 }
 
+/* Settings pages are built on first use, not at startup.
+ *
+ * All sixteen screens used to be instantiated during ui_panel_init(), which
+ * left the 96 KB LVGL heap at 15.5 KB free (83% used, see the "pages built"
+ * and "provision built" checkpoints). Opening the settings menu then had no
+ * room left to lay out and render, so the screen came up blank. Building the
+ * settings pages on demand keeps the home screen's headroom and only spends
+ * heap on pages the user actually visits. */
+static void build_pref_pages(void);
+
+static bool settings_page_built(screen_t s)
+{
+    switch (s) {
+    case SCR_QUICK:               return s_quick != NULL;
+    case SCR_SOUND:               return s_sound != NULL;
+    case SCR_SOUND_MORE:          return s_sound_more != NULL;
+    case SCR_QUIET:               return s_quiet != NULL;
+    case SCR_DISPLAY:             return s_display != NULL;
+    case SCR_SESSIONS:            return s_sessions != NULL;
+    case SCR_CONNECTION:          return s_connection != NULL;
+    case SCR_ABOUT:               return s_about != NULL;
+    case SCR_REPROVISION_CONFIRM: return s_reprovision != NULL;
+    default:                      return true;
+    }
+}
+
+static void ensure_settings_pages(screen_t target)
+{
+    /* SCR_SETTINGS itself stays built at startup: it is only six buttons and
+     * is the entry point for every settings page. */
+    if (target == SCR_SETTINGS) return;
+
+    if (!settings_page_built(target)) {
+        build_pref_pages();
+        log_ui_memory("settings pages built");
+    }
+    /* 声音 and 声音选项 reference each other through their back buttons;
+     * both are covered by the single build_pref_pages() pass above. */
+}
+
 static void on_settings_nav(lv_event_t *e)
 {
     screen_t target = (screen_t)(intptr_t)lv_event_get_user_data(e);
     refresh_prefs_ui();
+    ensure_settings_pages(target);
     show_screen(target);
 }
 
@@ -1552,7 +1977,7 @@ static bool queue_pref(panel_pref_field_t field, int value)
     };
     if (!panel_store_enqueue_control(&cmd)) {
         for (int i = 0; i < s_pref_status_count; i++) {
-            lv_label_set_text(s_pref_status[i], "忙碌，设置未保存");
+            lv_label_set_text(s_pref_status[i], "Busy; setting not saved");
         }
         panel_prefs_t p;
         panel_prefs_get(&p);
@@ -1562,7 +1987,7 @@ static bool queue_pref(panel_pref_field_t field, int value)
         return false;
     }
     for (int i = 0; i < s_pref_status_count; i++) {
-        lv_label_set_text(s_pref_status[i], "保存中…");
+        lv_label_set_text(s_pref_status[i], "Saving…");
     }
     return true;
 }
@@ -1579,16 +2004,25 @@ static void on_pref_click(lv_event_t *e)
     case PANEL_PREF_SOUND_DONE: case PANEL_PREF_QUIET_ENABLED:
     case PANEL_PREF_REDUCE_MOTION: case PANEL_PREF_VISUAL_ALERT:
     case PANEL_PREF_HIDE_IDLE: next = !v; break;
+    case PANEL_PREF_MOTION_WAKE:
+        /* No IMU means the toggle would silently do nothing, so say so
+         * instead of storing a preference that cannot be honoured. */
+        if (!panel_motion_present()) {
+            for (int i = 0; i < s_pref_status_count; i++)
+                lv_label_set_text(s_pref_status[i],
+                                  "No IMU on this board; touch still wakes");
+            return;
+        }
+        next = !v;
+        break;
     case PANEL_PREF_SOUND_SCOPE: case PANEL_PREF_SOUND_CLAUDE:
     case PANEL_PREF_SOUND_OPENCODE: case PANEL_PREF_SOUND_PI:
     case PANEL_PREF_CARD_ORDER: next = (v + 1) % 3; break;
     case PANEL_PREF_QUIET_START: case PANEL_PREF_QUIET_END:
         next = (v + 15) % 1440; break;
     case PANEL_PREF_UTC_OFFSET: next = v >= 840 ? -720 : v + 15; break;
-    case PANEL_PREF_IDLE_DIM_SECONDS:
-        next = v == 0 ? 30 : v == 30 ? 60 :
-               v == 60 ? 120 : v == 120 ? 300 : 0;
-        break;
+    case PANEL_PREF_IDLE_DISPLAY_SECONDS: next = standby_next(v); break;
+    case PANEL_PREF_IDLE_BLANK_SECONDS:   next = standby_next(v); break;
     case PANEL_PREF_DIM_BRIGHTNESS: next = v >= 50 ? 5 : v + 5; break;
     case PANEL_PREF_OVERVIEW_INTERVAL:
         next = v == 2 ? 3 : v == 3 ? 5 : v == 5 ? 10 : 2;
@@ -1626,13 +2060,13 @@ static void on_sound_test(lv_event_t *e)
     panel_prefs_t prefs;
     panel_prefs_get(&prefs);
     if (!panel_audio_ready()) {
-        lv_label_set_text(s_sound_status, "声音不可用，请检查扬声器");
+        lv_label_set_text(s_sound_status, "Sound unavailable; check speaker");
     } else if (lv_slider_get_value(s_sound_volume) == 0) {
-        lv_label_set_text(s_sound_status, "请先调高音量");
+        lv_label_set_text(s_sound_status, "Raise the volume first");
     } else {
         bool queued = panel_audio_play((panel_audio_kind_t)(intptr_t)lv_event_get_user_data(e));
         lv_label_set_text(s_sound_status, queued ?
-                          "仅试听；静音设置未改变" : "声音忙碌，请重试");
+                          "Preview only; mute setting unchanged" : "Sound busy, try again");
     }
 }
 
@@ -1646,29 +2080,34 @@ static void on_refresh(lv_event_t *e)
 static void on_jump_blocked(lv_event_t *e)
 {
     (void)e;
-    /* spec §2.2: tapping the blocked count jumps to the first blocked card */
+    /* spec §2.2: tapping the blocked count scrolls the first blocked session
+     * into view. With one list there is no page to jump to, so scroll the
+     * container by the row offset instead. */
     int idx = panel_store_first_blocked_index();
-    if (idx >= 0) {
-        s_page = idx / PAGE_SIZE;
-        panel_store_set_view_context(s_page, s_sel_term);
-        s_seen_generation = 0;  /* force redraw on next tick */
-    }
+    if (idx <= 0 || s_card_list == NULL) return;
+    int row = idx < s_cell_count ? idx : s_cell_count - 1;
+    lv_obj_scroll_to_view(lv_obj_get_child(s_card_list, row), LV_ANIM_ON);
 }
 
-static void on_home_gesture(lv_event_t *e)
-{
-    (void)e;
-    if (s_screen != SCR_HOME) return;
-    lv_indev_t *indev = lv_indev_active();
-    if (indev == NULL) return;
-    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
-    if (dir == LV_DIR_LEFT) page_next();
-    else if (dir == LV_DIR_RIGHT) page_prev();
-}
+/*
+ * Swipe paging is gone (UI_DESIGN.md §4.1). The home screen is a single
+ * scrolling list, so LVGL's own vertical scroll handling replaces both the
+ * LV_EVENT_GESTURE hook and the manual press/press/release swipe detector.
+ * A card tap therefore no longer races a page turn: once the list scrolls,
+ * LVGL suppresses CLICKED on the card underneath.
+ */
 
 static void on_action_btn(lv_event_t *e)
 {
-    panel_action_id_t act = (panel_action_id_t)(intptr_t)lv_event_get_user_data(e);
+    /* user_data is the slot index, not the action id; s_act_action[] is set by
+     * render_action_slots() and holds PANEL_ACT_NONE for inert slots. */
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (slot < 0 || slot >= 3) return;
+    panel_action_id_t act = s_act_action[slot];
+    /* STOP has no gateway Action literal yet and can never be delivered, so
+     * the slot stays dimmed and any click on it is ignored here too. */
+    if (act == PANEL_ACT_NONE || act == PANEL_ACT_STOP) return;
+
     panel_detail_t det;
     if (!panel_store_get_detail(&det)) return;
     /* the stored detail must still be the session the user is looking at;
@@ -1751,6 +2190,7 @@ static void on_result_back(lv_event_t *e)
 void ui_panel_init(void)
 {
     build_agent_icons();
+    log_font_probe();
     build_boot();
     log_ui_memory("boot built");
     s_boot_started_ms = ui_now_ms();
@@ -1765,11 +2205,12 @@ void ui_panel_init(void)
     build_confirm();
     build_result();
     build_settings();
-    build_pref_pages();
+    /* The ten settings pages are built on first use (ensure_settings_pages)
+     * to keep the LVGL heap available for the home screen. */
     log_ui_memory("pages built");
     build_provision();
     log_ui_memory("provision built");
-    panel_store_set_view_context(s_page, NULL);
+    panel_store_set_view_context(NULL);
     refresh_prefs_ui();
     refresh_power_ui();
 }
@@ -1830,18 +2271,11 @@ void ui_panel_tick(void)
         lv_label_set_text(s_det_hint, "请求已变化或过期，请刷新后重看");
     }
 
-    panel_prefs_t display_prefs;
-    panel_prefs_get(&display_prefs);
-    bool should_dim = display_prefs.idle_dim_seconds != 0 &&
-        s_screen != SCR_CONFIRM && s_screen != SCR_PROVISION &&
-        lv_display_get_inactive_time(NULL) >=
-            (uint32_t)display_prefs.idle_dim_seconds * 1000u;
-    if (should_dim != s_dimmed) {
-        s_dimmed = should_dim;
-        panel_display_set_brightness(should_dim ?
-                                     display_prefs.dim_brightness :
-                                     display_prefs.brightness);
-    }
+    /* Standby replaces the old flat "dim after idle" behaviour: the clock
+     * screen and the fully dark stage both own the brightness, so this runs
+     * before the store refresh below, which may still be about to touch the
+     * real screens. */
+    update_standby();
 
     /* 2. redraw when store generation changed */
     uint32_t gen = panel_store_generation();
@@ -1852,21 +2286,14 @@ void ui_panel_tick(void)
         update_alert_pulses();
         if (!gen_changed) return;
 
-        panel_agent_card_t cards[4];
+        /* One list, no paging: copy the visible cards straight into the
+         * static buffer (worker-owned snapshots stay off the LVGL stack). */
+        static panel_agent_card_t cards[PANEL_MAX_AGENTS];
         int count = 0, total = 0;
         panel_conn_state_t conn;
-        panel_store_get_page(cards, s_page, &count, &total, &conn);
+        count = panel_store_get_visible(cards, PANEL_MAX_AGENTS, &total, &conn);
         s_card_count = count;
-
-        /* clamp the page when the list shrank, then refetch that page */
-        int pages = (count + PAGE_SIZE - 1) / PAGE_SIZE;
-        if (pages < 1) pages = 1;
-        if (s_page >= pages) {
-            s_page = pages - 1;
-            panel_store_get_page(cards, s_page, &count, &total, &conn);
-            panel_store_set_view_context(s_page, s_sel_term);
-        }
-        if (s_page < 0) s_page = 0;
+        panel_store_set_view_context(s_sel_term);
 
         refresh_home(cards, count, total, conn);
         return;

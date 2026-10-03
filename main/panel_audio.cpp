@@ -18,6 +18,7 @@ static QueueHandle_t s_audio_q;
 static i2c_master_bus_handle_t s_bus;
 static volatile bool s_ready;
 static volatile bool s_stop_now;
+static volatile bool s_boot_pending;   /* boot chime requested before codec up */
 static volatile uint8_t s_desired_volume = 50;
 static i2s_chan_handle_t s_tx;
 static esp_codec_dev_handle_t s_codec;
@@ -27,6 +28,8 @@ extern const uint8_t done_pcm_start[] asm("_binary_done_pcm_start");
 extern const uint8_t done_pcm_end[] asm("_binary_done_pcm_end");
 extern const uint8_t request_pcm_start[] asm("_binary_request_pcm_start");
 extern const uint8_t request_pcm_end[] asm("_binary_request_pcm_end");
+extern const uint8_t boot_pcm_start[] asm("_binary_boot_pcm_start");
+extern const uint8_t boot_pcm_end[] asm("_binary_boot_pcm_end");
 
 static bool init_codec(void)
 {
@@ -89,12 +92,39 @@ static bool init_codec(void)
         .sample_rate = 16000,
         .mclk_multiple = 256,
     };
+
+    /*
+     * Open muted. Enabling the ES8311 DAC with a non-zero volume produces a
+     * DC step that the speaker amplifier turns into an audible pop, which
+     * previously landed right in the middle of the boot splash animation.
+     * auto_clear keeps the DMA buffer zeroed while muted, so the output stays
+     * at 0 V until the real volume is applied below.
+     */
+    if (esp_codec_dev_set_out_vol(s_codec, 0) != ESP_CODEC_DEV_OK) return false;
     if (esp_codec_dev_open(s_codec, &sample) != ESP_CODEC_DEV_OK) return false;
     return esp_codec_dev_set_out_vol(s_codec, s_desired_volume) == ESP_CODEC_DEV_OK;
 }
 
 static void play_pcm(panel_audio_kind_t kind)
 {
+    if (kind == PANEL_AUDIO_BOOT) {
+        /* Generated 8-bit chime (tools/sounds/make_boot_chime.py). Plays
+         * straight through: it is short, and interrupting it sounds worse
+         * than letting it finish. */
+        const uint8_t *p = boot_pcm_start;
+        const uint8_t *end = boot_pcm_end;
+        while (p < end && !s_stop_now) {
+            size_t len = (size_t)(end - p);
+            if (len > 512) len = 512;
+            if (esp_codec_dev_write(s_codec, (void *)p, (int)len) != ESP_CODEC_DEV_OK) {
+                ESP_LOGW(TAG, "audio write failed");
+                s_ready = false;
+                break;
+            }
+            p += len;
+        }
+        return;
+    }
     const uint8_t *start = kind == PANEL_AUDIO_REQUEST ? request_pcm_start : done_pcm_start;
     const uint8_t *end = kind == PANEL_AUDIO_REQUEST ? request_pcm_end : done_pcm_end;
     const uint8_t *p = start;
@@ -130,6 +160,13 @@ static void audio_task(void *arg)
     ESP_LOGI(TAG, "ES8311 playback ready (speaker connection requires physical check)");
     panel_audio_kind_t kind;
     uint8_t applied_volume = s_desired_volume;
+    /* A boot chime requested during app_main() could not be queued before the
+     * codec existed, so honour it as soon as the task comes up. */
+    if (s_boot_pending) {
+        s_boot_pending = false;
+        kind = PANEL_AUDIO_BOOT;
+        play_pcm(kind);
+    }
     for (;;) {
         if (s_desired_volume != applied_volume) {
             applied_volume = s_desired_volume;
@@ -163,7 +200,8 @@ extern "C" bool panel_audio_ready(void) { return s_ready; }
 extern "C" bool panel_audio_play(panel_audio_kind_t kind)
 {
     if (!s_ready || s_audio_q == NULL ||
-        (kind != PANEL_AUDIO_REQUEST && kind != PANEL_AUDIO_DONE)) return false;
+        (kind != PANEL_AUDIO_REQUEST && kind != PANEL_AUDIO_DONE &&
+         kind != PANEL_AUDIO_BOOT)) return false;
     s_stop_now = false;
     if (kind == PANEL_AUDIO_REQUEST) {
         if (xQueueSendToFront(s_audio_q, &kind, 0) == pdTRUE) return true;
@@ -172,6 +210,23 @@ extern "C" bool panel_audio_play(panel_audio_kind_t kind)
         return xQueueSendToFront(s_audio_q, &kind, 0) == pdTRUE;
     }
     return xQueueSend(s_audio_q, &kind, 0) == pdTRUE;
+}
+
+extern "C" void panel_audio_play_boot(void)
+{
+    /* Fired from app_main() while the codec is still initialising. Defer it:
+     * the audio task plays it as soon as s_ready goes true. Honours
+     * sound_enabled so a muted device stays silent. */
+    panel_prefs_t p;
+    panel_prefs_get(&p);
+    if (!p.sound_enabled || p.sound_volume == 0) return;
+    if (s_ready && s_audio_q != NULL) {
+        panel_audio_kind_t kind = PANEL_AUDIO_BOOT;
+        s_stop_now = false;
+        xQueueSendToFront(s_audio_q, &kind, 0);
+        return;
+    }
+    s_boot_pending = true;
 }
 
 extern "C" void panel_audio_stop(void)

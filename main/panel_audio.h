@@ -12,12 +12,15 @@ extern "C" {
 typedef enum {
     PANEL_AUDIO_REQUEST = 1,
     PANEL_AUDIO_DONE = 2,
+    PANEL_AUDIO_BOOT = 3,
 } panel_audio_kind_t;
 
 /* One task owns ES8311 and I2S. Non-blocking calls from UI/worker only. */
 bool panel_audio_start(i2c_master_bus_handle_t bus);
 bool panel_audio_ready(void);
 bool panel_audio_play(panel_audio_kind_t kind);
+/** Play the boot chime; safe to call before the codec reports ready (no-op). */
+void panel_audio_play_boot(void);
 void panel_audio_stop(void);
 void panel_audio_set_volume(uint8_t percent);
 

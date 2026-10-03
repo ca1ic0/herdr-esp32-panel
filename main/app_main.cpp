@@ -27,6 +27,7 @@
 #include "panel_display.h"
 #include "panel_audio.h"
 #include "panel_power.h"
+#include "panel_motion.h"
 #include "panel_prefs.h"
 #include "panel_store.h"
 #include "panel_worker.h"
@@ -122,6 +123,10 @@ extern "C" void app_main(void)
     Lvgl_PortInit(*user_display);
     log_boot_memory("LVGL ready");
 
+    /* IMU on the same I2C0 bus. Only feeds the standby wake path, so it must
+     * not delay the first frame; a missing IMU is not an error. */
+    panel_motion_start(user_i2cbus.Get_I2cBusHandle());
+
     /* Bring up the splash before network and codec startup so it animates
      * while those subsystems initialise. LVGL remains owned by its task. */
     panel_store_init();
@@ -136,6 +141,10 @@ extern "C" void app_main(void)
 
     if (!panel_audio_start(user_i2cbus.Get_I2cBusHandle())) {
         ESP_LOGW(TAG, "audio task unavailable; visual alerts remain active");
+    } else {
+        /* Boot chime once the codec is actually up. The task sets s_ready
+         * after init_codec(), so this is queued, never blocking. */
+        panel_audio_play_boot();
     }
     wifi_connect_start();       /* enters provisioning automatically when unconfigured */
     if (!provisioning_active()) {

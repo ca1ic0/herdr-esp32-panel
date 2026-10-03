@@ -41,10 +41,17 @@ static inline lv_font_t *ui_font(int size)
 {
 #ifdef UI_HAVE_CJK_FONT
     /* Mutable copies of the built-in Montserrat fonts with the CJK subset
-     * chained as fallback. The built-ins are const, so copy then chain. */
-    static lv_font_t f16, f20, f24;
+     * chained as fallback. The built-ins are const, so copy then chain.
+     * Every size must chain a CJK fallback: Montserrat has no CJK glyphs, so
+     * without it Chinese text renders as the .notdef box. There is no
+     * generated 12/14 px CJK cut, so those chain the 16 px cut (nearest). */
+    static lv_font_t f12, f14, f16, f20, f24;
     static bool ready;
     if (!ready) {
+        f12 = lv_font_montserrat_12;
+        f12.fallback = &font_cjk_16;
+        f14 = lv_font_montserrat_14;
+        f14.fallback = &font_cjk_16;
         f16 = lv_font_montserrat_16;
         f16.fallback = &font_cjk_16;
         f20 = lv_font_montserrat_20;
@@ -54,8 +61,8 @@ static inline lv_font_t *ui_font(int size)
         ready = true;
     }
     switch (size) {
-    case 12: return (lv_font_t *)&lv_font_montserrat_12;
-    case 14: return (lv_font_t *)&lv_font_montserrat_14;
+    case 12: return &f12;
+    case 14: return &f14;
     case 18:
     case 20: return &f20;
     case 24:

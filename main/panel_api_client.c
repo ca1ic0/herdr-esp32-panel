@@ -473,6 +473,9 @@ static const char *action_to_str(panel_action_id_t a)
     case PANEL_ACT_ALLOW_ALWAYS: return "allow_always";
     case PANEL_ACT_DENY:         return "deny";
     case PANEL_ACT_CONTINUE:     return "continue";
+    /* PANEL_ACT_STOP has no gateway Action literal yet, so it is never sent;
+     * the UI shows it as an unavailable hint instead of offering a request
+     * the gateway would reject. */
     default:                     return NULL;
     }
 }

@@ -26,7 +26,13 @@ typedef enum {
     PANEL_PREF_QUIET_END,
     PANEL_PREF_UTC_OFFSET,
     PANEL_PREF_BRIGHTNESS,
-    PANEL_PREF_IDLE_DIM_SECONDS,
+    /* Standby is two-stage (UI_DESIGN.md §4.3): after idle_display_seconds
+     * the panel shows the clock screen, and after idle_blank_seconds the
+     * screen goes fully dark. Either stage can be disabled with 0. The two
+     * fields must stay adjacent and before PANEL_PREF_DIM_BRIGHTNESS. */
+    PANEL_PREF_IDLE_DISPLAY_SECONDS,
+    PANEL_PREF_IDLE_BLANK_SECONDS,
+    PANEL_PREF_MOTION_WAKE,
     PANEL_PREF_DIM_BRIGHTNESS,
     PANEL_PREF_REDUCE_MOTION,
     PANEL_PREF_VISUAL_ALERT,
@@ -35,6 +41,17 @@ typedef enum {
     PANEL_PREF_HIDE_IDLE,
     PANEL_PREF_COUNT,
 } panel_pref_field_t;
+
+/* Standby stage durations in seconds. 0 disables that stage. */
+enum {
+    PANEL_STANDBY_OFF = 0,
+    PANEL_STANDBY_1MIN = 60,
+    PANEL_STANDBY_2MIN = 120,
+    PANEL_STANDBY_3MIN = 180,
+    PANEL_STANDBY_5MIN = 300,
+    PANEL_STANDBY_10MIN = 600,
+    PANEL_STANDBY_15MIN = 900,
+};
 
 enum { PANEL_SOUND_ALL = 0, PANEL_SOUND_PAGE = 1, PANEL_SOUND_SELECTED = 2 };
 enum { PANEL_SOUND_INHERIT = 0, PANEL_SOUND_ON = 1, PANEL_SOUND_OFF = 2 };
@@ -54,7 +71,9 @@ typedef struct {
     uint16_t quiet_end;
     int16_t utc_offset_minutes;
     uint8_t brightness;
-    uint16_t idle_dim_seconds;     /* 0, 30, 60, 120, 300 */
+    uint16_t idle_display_seconds; /* clock screen after N s idle; 0 = never */
+    uint16_t idle_blank_seconds;   /* fully dark after N s idle; 0 = never */
+    uint8_t motion_wake;           /* accelerometer wakes the standby screen */
     uint8_t dim_brightness;
     uint8_t reduce_motion;
     uint8_t visual_alert;
